@@ -1,0 +1,48 @@
+# Upstream checkouts created by scripts/setup/bootstrap_upstream.sh
+/robodojo/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+venv/
+.venv/
+
+# Project artifacts and downloaded assets
+data/
+datasets/
+models/
+checkpoints/
+checkpoints.*/
+images/
+logs/
+cache/
+cache_*/
+podman-storage/
+libpod/
+eval_result/
+Assets/
+*.npy
+*.npz
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.tar
+*.tar.gz
+*.zip
+
+# Local configuration and accidental outputs
+.env
+*.log
+*.bak
+*.bak.*
+*.orig.*
+*.swp
+*~
+.DS_Store
+Thumbs.db

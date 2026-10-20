@@ -1,0 +1,1325 @@
+diff --git a/policy/Pi_05/deploy.yml b/policy/Pi_05/deploy.yml
+index 7c2f1cd..374bc12 100644
+--- a/policy/Pi_05/deploy.yml
++++ b/policy/Pi_05/deploy.yml
+@@ -8,7 +8,7 @@ env_cfg_type: null
+ seed: null
+ eval_batch: true
+ 
+-checkpoint_num: 59999
++checkpoint_num: 19999
+ result_dir: "./results/pi05/"
+ obs_transform_pipeline: "xspark-v1.0"
+ 
+@@ -16,7 +16,36 @@ obs_transform_pipeline: "xspark-v1.0"
+ action_type: joint
+ policy_uv_env_path: openpi
+ # Must match the config used by train.sh (default OPENPI_TRAIN_CONFIG_NAME).
+-train_config_name: pi05_base_aloha_full_sim_arx-x5_seed_0
++# Phase 9 记忆评测：v2 配方（RoboDojo-sim-arx_x5-history-v2-lora-seed0：
++#   pad_mode=repeat_oldest + history_inject=proj_identity + contrast roll 损失）。
++train_config_name: pi05_aloha_sim_history_v2_arx-x5_seed_0
+ repo_id: arx_x5_sim
+ 
++# Phase 6：slots 模式 = 训练侧 RoboDojoHistoryTransform 同口径（20 槽 × 128×128，1 Hz@25fps，
++# 每 25 步 1 帧、只取严格早于当前帧的样本、最旧在左、空槽 mask=False），由 Policy.infer 顶层透传
++# history_images/history_mask 给模型。启动时 Model 会断言与 train_config 逐项一致，不一致直接报错。
++# 回退官方基线复测（无记忆）：history_enabled: false + train_config_name: pi05_base_aloha_full_sim_arx-x5_seed_0
++#   + checkpoint_num: 59999（history_* 键保留不影响 false 分支）。
++history_enabled: true
++history_mode: slots
++history_image_key: cam_high
++history_slots: 20
++history_slot_size: 128
++history_fps: 1.0
++# [pi05-history] Phase 9：pad 槽处理方式，必须与 train_config_name 对应配置的
++# RoboDojoHistoryTransform.pad_mode 一致（启动时断言；zero = 旧行为，repeat_oldest = 断时钟模式）。
++history_pad_mode: repeat_oldest
++runtime_fps: 25.0
++history_action_interval: 25
++# 以下仅 Phase 3 消融（collage/multi/text）使用，slots 模式忽略。
++history_collage_frames: 4
++history_collage_size: 224
++history_multi_frames: 3
++history_captioner_model: null  # 仅 text 消融需要；填写本地模型路径，勿提交绝对路径
++history_captioner_device: cuda:0
++history_text_max_new_tokens: 48
++history_caption_prompt: >-
++  In under 20 words, list the visible objects with their colors and left/right positions.
++  Start directly with the objects, like: red cube left, blue cube center, green cylinder right.
++
+ port: 6000
+diff --git a/policy/Pi_05/model.py b/policy/Pi_05/model.py
+index b7ffe70..a4567f7 100644
+--- a/policy/Pi_05/model.py
++++ b/policy/Pi_05/model.py
+@@ -3,7 +3,9 @@
+ """
+ #!/usr/bin/python3
+ """
++from collections import deque
+ from pathlib import Path
++import math
+ import os
+ import sys
+ from typing import Any
+@@ -26,6 +28,15 @@ from XPolicyLab.utils.process_data import (
+ _POLICY_DIR = Path(__file__).resolve().parent
+ _CHECKPOINTS_DIR = _POLICY_DIR / "checkpoints"
+ 
++# [pi05-history] 历史帧相机候选名（与 encode_obs 保持一致）。
++_HISTORY_IMAGE_CANDIDATES = {
++    "cam_high": ["cam_high", "cam_head", "head_camera", "top_camera"],
++    "cam_left_wrist": ["cam_left_wrist", "left_camera", "left_wrist", "wrist_left"],
++    "cam_right_wrist": ["cam_right_wrist", "right_camera", "right_wrist", "wrist_right"],
++}
++# [pi05-history] B1 拼贴图网格：帧数 → (行, 列)。
++_COLLAGE_GRID = {4: (2, 2), 6: (2, 3), 8: (2, 4), 9: (3, 3), 12: (3, 4), 16: (4, 4), 20: (4, 5), 25: (5, 5)}
++
+ 
+ def _extract_step_number(value: Any) -> int | None:
+     matches = [part for part in str(value).split("/") if part]
+@@ -95,9 +106,22 @@ class Model(ModelTemplate):
+         )
+         self.observation_window: dict[str, Any] | None = None
+         self._latest_env_idx_list: list[int] = [0]
++        # [pi05-history] 推理侧历史（记忆）缓冲：env_idx → deque[(sequence, completed_actions, CHW uint8)]。
++        self._configure_history(model_cfg)
++        self._history_by_env: dict[Any, deque] = {}
++        self._history_sequence_by_env: dict[Any, int] = {}
++        self._history_logged_envs: set[Any] = set()
++        self._captioner = None
++        self._caption_cache: dict[Any, dict[int, str]] = {}
++        self._caption_failed_envs: set[Any] = set()
+ 
+         self.policy = self.get_model(model_cfg=model_cfg)
+         self.model = self.policy
++        if self.history_enabled:
++            # [pi05-history] Phase 6：slots 评测口径必须与训练配置一致（不一致直接拒绝启动）。
++            self._assert_history_eval_consistency()
++        if self.history_enabled and self.history_mode == "text" and self.history_captioner_model:
++            self._get_captioner()  # 启动时预加载，避免首个 episode 中途停顿
+ 
+     def get_model(self, model_cfg: dict[str, Any]):
+         train_config_name = model_cfg.get("train_config_name", "pi05_aloha")
+@@ -105,12 +129,286 @@ class Model(ModelTemplate):
+         model_root = _resolve_pi05_model_root(model_cfg)
+ 
+         config = _config.get_config(train_config_name)
++        # [pi05-history] 记录训练配置，供启动时校验 slots 评测口径（Phase 6）。
++        self._train_config = config
++        self._train_config_name = train_config_name
+         norm_stats = None
+         if repo_id is not None:
+             norm_stats = _normalize.load(model_root / "assets" / str(repo_id))
+ 
+         return _policy_config.create_trained_policy(config, str(model_root), norm_stats=norm_stats)
+ 
++    def _configure_history(self, model_cfg: dict[str, Any]) -> None:
++        """[pi05-history] 读取历史（记忆）配置；默认关闭，缺省行为与基线完全一致。"""
++        self.history_enabled = bool(model_cfg.get("history_enabled", False))
++        self.history_mode = str(model_cfg.get("history_mode") or "collage")
++        self.history_image_key = str(model_cfg.get("history_image_key") or "cam_high")
++        if self.history_image_key not in _HISTORY_IMAGE_CANDIDATES:
++            raise ValueError(f"unknown history_image_key: {self.history_image_key}")
++        self.history_slots = int(model_cfg.get("history_slots") or 20)
++        self.history_slot_size = int(model_cfg.get("history_slot_size") or 128)
++        self.history_collage_frames = int(model_cfg.get("history_collage_frames") or 4)
++        self.history_collage_size = int(model_cfg.get("history_collage_size") or 224)
++        self.history_multi_frames = int(model_cfg.get("history_multi_frames") or 3)
++        self.history_captioner_model = str(model_cfg.get("history_captioner_model") or "")
++        self.history_captioner_device = str(model_cfg.get("history_captioner_device") or "cuda:0")
++        self.history_text_max_new_tokens = int(model_cfg.get("history_text_max_new_tokens") or 32)
++        self.history_caption_prompt = str(
++            model_cfg.get("history_caption_prompt")
++            or "Describe this robot camera image in one short sentence: object colors and left/right positions."
++        )
++        self.runtime_fps = float(model_cfg.get("runtime_fps") or 25.0)
++        configured_history_fps = float(model_cfg.get("history_fps") or 1.0)
++        default_interval = int(round(self.runtime_fps / configured_history_fps))
++        self.history_action_interval = int(model_cfg.get("history_action_interval") or default_interval)
++        if self.history_enabled and (self.history_slots <= 0 or self.history_action_interval <= 0):
++            raise ValueError("history_slots / history_action_interval must be positive")
++        # [pi05-history] Phase 9：pad 槽处理方式，必须与训练侧 RoboDojoHistoryTransform.pad_mode 一致。
++        #   zero（默认）= 空槽补 0 + mask=False；repeat_oldest = 最旧有效帧回填 + mask 全 True。
++        self.history_pad_mode = str(model_cfg.get("history_pad_mode") or "zero")
++        if self.history_pad_mode not in ("zero", "repeat_oldest"):
++            raise ValueError(f"unknown history_pad_mode: {self.history_pad_mode}")
++        self._history_buffer_maxlen = self.history_slots + 1
++
++    def _history_train_spec(self) -> dict[str, Any]:
++        """[pi05-history] 提取 train_config 的 history 口径（slots/interval/size）。"""
++        config = getattr(self, "_train_config", None)
++        spec: dict[str, Any] = {
++            "train_config_name": getattr(self, "_train_config_name", None),
++            "slots": 0,
++            "interval": None,
++            "size": None,
++            "pad_mode": None,
++        }
++        if config is None:
++            return spec
++        spec["slots"] = int(getattr(config.model, "history_slots", 0) or 0)
++        # [pi05-history] Phase 9：优先读 data 工厂上的字段（train_config.data 在 create() 之前
++        # 只有工厂字段、没有 data_transforms —— 早先的 interval/size 校验因此一直是空转，这里一并修好）。
++        data_cfg = getattr(config, "data", None)
++        spec["interval"] = int(getattr(data_cfg, "history_interval", 0) or 0) or None
++        spec["pad_mode"] = str(getattr(data_cfg, "history_pad_mode", "zero") or "zero")
++        # 若 transforms 已 resolve（create() 之后），以 transform 上的真实值覆盖（更精确）。
++        group = getattr(data_cfg, "data_transforms", None)
++        for transform in getattr(group, "inputs", ()) or ():
++            if transform.__class__.__name__ == "RoboDojoHistoryTransform":
++                spec["interval"] = int(getattr(transform, "interval", 0) or 0)
++                spec["size"] = int(getattr(transform, "height", 0) or 0)
++                spec["pad_mode"] = str(getattr(transform, "pad_mode", "zero") or "zero")
++                break
++        return spec
++
++    def _assert_history_eval_consistency(self) -> None:
++        """[pi05-history] Phase 6：slots 评测口径与训练配置逐项对齐，不一致直接拒绝启动。"""
++        spec = self._history_train_spec()
++        if self.history_mode != "slots":
++            print(
++                f"[Pi05] history enabled: mode={self.history_mode} slots={self.history_slots} "
++                f"interval={self.history_action_interval}（train slots={spec['slots']}；非 slots 模式不做一致性断言）",
++                flush=True,
++            )
++            return
++        problems: list[str] = []
++        if spec["slots"] != self.history_slots:
++            problems.append(f"slots deploy={self.history_slots} vs train={spec['slots']}")
++        if spec["interval"] is not None and spec["interval"] != self.history_action_interval:
++            problems.append(f"interval deploy={self.history_action_interval} vs train={spec['interval']}")
++        if spec["size"] is not None and spec["size"] != self.history_slot_size:
++            problems.append(f"size deploy={self.history_slot_size} vs train={spec['size']}")
++        if spec["pad_mode"] is not None and spec["pad_mode"] != self.history_pad_mode:
++            problems.append(f"pad_mode deploy={self.history_pad_mode} vs train={spec['pad_mode']}")
++        if problems:
++            raise ValueError(
++                "history(slots) 评测与训练配置不一致："
++                + "; ".join(problems)
++                + "。请检查 deploy.yml：train_config_name 必须是 history 训练配置，"
++                "history_slots/history_fps/history_slot_size/history_pad_mode 必须与训练一致。"
++            )
++        print(
++            f"[Pi05] history(slots) 与训练配置一致: train_config={spec['train_config_name']} "
++            f"slots={self.history_slots} interval={self.history_action_interval} size={self.history_slot_size} "
++            f"pad_mode={self.history_pad_mode}",
++            flush=True,
++        )
++
++    def _extract_history_frame(self, obs: dict) -> np.ndarray:
++        """从客户端观测取历史相机帧，统一成 CHW uint8。"""
++        if "images" in obs and self.history_image_key in obs["images"]:
++            return ensure_chw_uint8(obs["images"][self.history_image_key])
++        return ensure_chw_uint8(extract_image(obs, _HISTORY_IMAGE_CANDIDATES[self.history_image_key]))
++
++    def _append_history_observation(self, obs: dict, env_idx: Any) -> None:
++        """每次 update_obs（每执行一个动作步）调用一次；按 history_action_interval 抽帧（DM0.5 口径）。"""
++        sequence = self._history_sequence_by_env.get(env_idx, 0) + 1
++        self._history_sequence_by_env[env_idx] = sequence
++        completed_actions = sequence - 1
++        if completed_actions % self.history_action_interval != 0:
++            return
++        history = self._history_by_env.setdefault(env_idx, deque(maxlen=self._history_buffer_maxlen))
++        frame = self._extract_history_frame(obs)
++        if self.history_mode == "slots":
++            # 与训练侧 sidecar 同口径：resize_with_pad 到 128×128（黑边）；在抽帧时缩放，避免每步 infer 重复计算。
++            frame = resize_chw_uint8(frame, self.history_slot_size)
++        history.append((sequence, completed_actions, frame.copy()))
++
++    def _history_frames_for(self, env_idx: Any) -> list[np.ndarray | None]:
++        """返回 slots 槽 oldest→newest 历史帧（左侧补 None），排除过新的一帧（DM0.5 口径）。"""
++        return [entry[1] if entry is not None else None for entry in self._history_entries_for(env_idx)]
++
++    def _history_entries_for(self, env_idx: Any) -> list[tuple[int, np.ndarray] | None]:
++        """返回 slots 槽 oldest→newest (sequence, frame)（左侧补 None），供 caption 缓存使用。"""
++        retained = list(self._history_by_env.get(env_idx, ()))
++        completed_actions = max(self._history_sequence_by_env.get(env_idx, 0) - 1, 0)
++        entries = [
++            (sequence, frame)
++            for sequence, frame_completed, frame in retained
++            if completed_actions - frame_completed >= self.history_action_interval
++        ][-self.history_slots :]
++        return [None] * (self.history_slots - len(entries)) + entries
++
++    def _get_captioner(self):
++        """[pi05-history] B3：惰性加载 VLM captioner（同进程/GPU，显存与 JAX 共存）。"""
++        if self._captioner is not None:
++            return self._captioner
++        if not self.history_captioner_model or not os.path.isdir(self.history_captioner_model):
++            raise FileNotFoundError(f"history_captioner_model not found: {self.history_captioner_model!r}")
++        import torch
++        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
++
++        processor = AutoProcessor.from_pretrained(self.history_captioner_model)
++        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
++            self.history_captioner_model,
++            torch_dtype=torch.bfloat16,
++            device_map=self.history_captioner_device,
++        )
++        model.eval()
++        self._captioner = (processor, model)
++        print(f"[Pi05] captioner loaded: {self.history_captioner_model} on {self.history_captioner_device}", flush=True)
++        return self._captioner
++
++    def _generate_caption(self, frame: np.ndarray) -> str:
++        from PIL import Image
++        import torch
++
++        processor, model = self._get_captioner()
++        image = Image.fromarray(np.transpose(frame, (1, 2, 0)))
++        messages = [
++            {
++                "role": "user",
++                "content": [
++                    {"type": "image", "image": image},
++                    {"type": "text", "text": self.history_caption_prompt},
++                ],
++            }
++        ]
++        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
++        inputs = processor(text=[text], images=[image], return_tensors="pt").to(self.history_captioner_device)
++        with torch.inference_mode():
++            output_ids = model.generate(**inputs, max_new_tokens=self.history_text_max_new_tokens, do_sample=False)
++        generated = output_ids[:, inputs["input_ids"].shape[1] :]
++        caption = processor.batch_decode(generated, skip_special_tokens=True)[0]
++        caption = " ".join(caption.split())
++        # 截断保护：若达到 token 上限且未以句号收尾，回切到最后一个完整句
++        if caption and caption[-1] not in ".!?":
++            cut = max(caption.rfind("."), caption.rfind("!"), caption.rfind("?"))
++            if cut > 0:
++                caption = caption[: cut + 1]
++        return caption
++
++    def _caption_for(self, env_idx: Any, sequence: int, frame: np.ndarray) -> str:
++        cache = self._caption_cache.setdefault(env_idx, {})
++        if sequence in cache:
++            return cache[sequence]
++        try:
++            caption = self._generate_caption(frame)
++        except Exception as exc:  # noqa: BLE001 —— captioner 失败不阻断评测，只记一次
++            if env_idx not in self._caption_failed_envs:
++                self._caption_failed_envs.add(env_idx)
++                print(f"[Pi05] captioner failed (env={env_idx}): {exc}", flush=True)
++            caption = ""
++        cache[sequence] = caption
++        if len(cache) > self.history_slots:
++            for key in sorted(cache)[: len(cache) - self.history_slots]:
++                cache.pop(key, None)
++        return caption
++
++    def _attach_history(self, observation: dict, env_idx: Any) -> dict:
++        """历史消费：B1 拼贴图 / B2 多帧多图 / B3 文本 caption / Phase 6 slots（history_images/history_mask 顶层透传）。"""
++        if not self.history_enabled:
++            return observation
++        recent = [frame for frame in self._history_frames_for(env_idx) if frame is not None]
++        if self.history_mode == "collage":
++            recent = recent[-self.history_collage_frames :]
++            if recent and env_idx not in self._history_logged_envs:
++                self._history_logged_envs.add(env_idx)
++                print(
++                    f"[Pi05] history active: env={env_idx} usable={len(recent)} "
++                    f"collage={self.history_collage_frames}@{self.history_collage_size}",
++                    flush=True,
++                )
++            observation["images"]["cam_history"] = build_history_collage(
++                recent, self.history_collage_frames, self.history_collage_size
++            )
++        elif self.history_mode == "multi":
++            recent = recent[-self.history_multi_frames :]
++            if recent and env_idx not in self._history_logged_envs:
++                self._history_logged_envs.add(env_idx)
++                print(
++                    f"[Pi05] history active: env={env_idx} usable={len(recent)} "
++                    f"multi={self.history_multi_frames}",
++                    flush=True,
++                )
++            for index, frame in enumerate(recent):
++                observation["images"][f"cam_history_{index}"] = frame
++        elif self.history_mode == "slots":
++            # Phase 6：与训练侧 RoboDojoHistoryTransform 同口径的顶层 history_images/history_mask，
++            # 由 Policy.infer 透传给模型（20 槽、最旧在左、pad 槽 mask=False）。
++            frames = self._history_frames_for(env_idx)
++            history = np.zeros(
++                (self.history_slots, 3, self.history_slot_size, self.history_slot_size), dtype=np.uint8
++            )
++            mask = np.zeros((self.history_slots,), dtype=np.bool_)
++            for offset, frame in enumerate(frames):
++                if frame is None:
++                    continue
++                history[offset] = frame
++                mask[offset] = True
++            # [pi05-history] Phase 9：与训练侧 pad_mode="repeat_oldest" 同口径 —— 左侧空槽用最旧
++            # 有效帧回填、mask 全 True，保证训练/评测的"可见槽位数"语义一致（断时钟捷径）。
++            if self.history_pad_mode == "repeat_oldest" and 0 < int(mask.sum()) < self.history_slots:
++                first = int(np.argmax(mask))
++                history[:first] = history[first]
++                mask[:first] = True
++            observation["history_images"] = history
++            observation["history_mask"] = mask
++            usable = int(mask.sum())
++            if usable and env_idx not in self._history_logged_envs:
++                self._history_logged_envs.add(env_idx)
++                print(
++                    f"[Pi05] history active: env={env_idx} usable={usable}/{self.history_slots} "
++                    f"slots@{self.history_slot_size}",
++                    flush=True,
++                )
++        elif self.history_mode == "text":
++            entries = [entry for entry in self._history_entries_for(env_idx) if entry is not None]
++            parts: list[str] = []
++            if entries:
++                chosen = [entries[0]] if len(entries) == 1 else [entries[0], entries[-1]]
++                captions = [self._caption_for(env_idx, seq, frame) for seq, frame in chosen]
++                captions = [caption for caption in captions if caption]
++                if captions:
++                    parts = [f"earlier {captions[0]}"]
++                    if len(captions) > 1:
++                        parts.append(f"recently {captions[-1]}")
++            if parts:
++                if env_idx not in self._history_logged_envs:
++                    self._history_logged_envs.add(env_idx)
++                    print(f"[Pi05] history active: env={env_idx} text_captions={len(parts)}", flush=True)
++                observation["prompt"] = f"{observation['prompt']} Memory: {'; '.join(parts)}."
++        else:
++            raise ValueError(f"unsupported history_mode: {self.history_mode}")
++        return observation
++
+     def update_obs(self, obs):
+         self.update_obs_batch([obs])
+ 
+@@ -120,6 +418,9 @@ class Model(ModelTemplate):
+             encode_obs(obs, self.action_type, self.robot_action_dim_info) for obs in obs_list
+         ]
+         self.observation_window = stack_obs(encoded_obs_list)
++        if self.history_enabled:
++            for env_idx, obs in zip(self._latest_env_idx_list, obs_list):
++                self._append_history_observation(obs, env_idx)
+ 
+     def get_action(self, **kwargs):
+         action_list = self.get_action_batch(env_idx_list=[self._latest_env_idx_list[0]], **kwargs)
+@@ -133,8 +434,9 @@ class Model(ModelTemplate):
+         # actions = self.policy.infer(self.observation_window, **kwargs)["actions"]
+         action_list = []
+ 
+-        for batch_index, _ in enumerate(env_idx_list):
++        for batch_index, env_idx in enumerate(env_idx_list):
+             single_observation = slice_stacked_obs(self.observation_window, batch_index)
++            single_observation = self._attach_history(single_observation, env_idx)
+             actions = self.policy.infer(single_observation, **kwargs)["actions"]
+             if self.robot_action_dim_info is None:
+                 action_list.append(actions)
+@@ -153,6 +455,9 @@ class Model(ModelTemplate):
+     def reset(self):
+         self.observation_window = None
+         self._latest_env_idx_list = [0]
++        self._history_by_env.clear()
++        self._history_sequence_by_env.clear()
++        self._caption_cache.clear()
+ 
+     def reset_obsrvationwindows(self):
+         self.reset()
+@@ -245,3 +550,39 @@ def ensure_chw_uint8(image):
+         raise ValueError(f"Unsupported image shape: {image.shape}")
+ 
+     return np.transpose(image_hwc, (2, 0, 1))
++
++
++def resize_chw_uint8(image: np.ndarray, size: int) -> np.ndarray:
++    """[pi05-history] CHW uint8 → resize_with_pad(黑边) → size×size CHW，与 sidecar 构建口径一致。"""
++    if image.shape[1] == size and image.shape[2] == size:
++        return image
++    from openpi.shared.image_tools import resize_with_pad  # noqa: PLC0415
++
++    resized = resize_with_pad(np.transpose(image, (1, 2, 0)), size, size)
++    return np.transpose(np.asarray(resized), (2, 0, 1))
++
++
++def build_history_collage(frames, grid_frames, size=224):
++    """[pi05-history] B1：把最近若干帧按网格拼成 (3, size, size) uint8（最旧在左上，最新在右下）。"""
++    from PIL import Image
++
++    rows, cols = _COLLAGE_GRID.get(grid_frames, (0, 0))
++    if rows <= 0:
++        cols = int(math.ceil(math.sqrt(grid_frames)))
++        rows = int(math.ceil(grid_frames / cols))
++    canvas = np.zeros((size, size, 3), dtype=np.uint8)
++    cell_h = int(math.ceil(size / rows))
++    cell_w = int(math.ceil(size / cols))
++    padded = [None] * max(0, grid_frames - len(frames)) + list(frames[-grid_frames:])
++    for index, frame in enumerate(padded[-grid_frames:]):
++        if frame is None:
++            continue
++        row, col = divmod(index, cols)
++        y0, x0 = row * cell_h, col * cell_w
++        if y0 >= size or x0 >= size:
++            continue
++        height, width = min(cell_h, size - y0), min(cell_w, size - x0)
++        image = Image.fromarray(np.transpose(frame, (1, 2, 0)))
++        image = image.resize((width, height), Image.BILINEAR)
++        canvas[y0 : y0 + height, x0 : x0 + width] = np.asarray(image)
++    return np.transpose(canvas, (2, 0, 1))
+diff --git a/policy/Pi_05/openpi/scripts/train.py b/policy/Pi_05/openpi/scripts/train.py
+index de23e17..81097c8 100644
+--- a/policy/Pi_05/openpi/scripts/train.py
++++ b/policy/Pi_05/openpi/scripts/train.py
+@@ -149,14 +149,34 @@ def train_step(
+         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
+     ):
+         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+-        return jnp.mean(chunked_loss)
++        # [pi05-keyframe] Phase 8：归一化加权均值 Σ wᵢℓᵢ/Σ wᵢ（关键帧加权）。
++        # loss_weight=None（未配置权重表）时退回原实现，保证与旧版逐位一致。
++        per_sample = jnp.mean(chunked_loss, axis=-1)
++        weight = observation.loss_weight
++        if weight is None:
++            loss = jnp.mean(chunked_loss)
++        else:
++            weight = jnp.asarray(weight, dtype=jnp.float32)
++            loss = jnp.sum(per_sample * weight) / jnp.maximum(jnp.sum(weight), 1e-6)
++        # [pi05-contrast] Phase 9：内容对比辅助损失（默认 contrast_mode="none" → 返回全 0，行为与旧版一致）。
++        # 返回 (总 loss, 诊断 dict)：总 loss 用于反传，dict 只做日志（loss_main/contrast_*）。
++        contrast_fn = getattr(model, "compute_contrast_aux", None)
++        if contrast_fn is None:
++            contrast = {}
++        else:
++            contrast = contrast_fn(rng, observation, actions, per_sample, train=True)
++        aux = contrast.get("contrast_aux", jnp.zeros((), jnp.float32))
++        info = {"loss_main": loss, **contrast}
++        return loss + aux, info
+ 
+     train_rng = jax.random.fold_in(rng, state.step)
+     observation, actions = batch
+ 
+     # Filter out frozen params.
+     diff_state = nnx.DiffState(0, config.trainable_filter)
+-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
++    (loss, aux_info), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
++        model, train_rng, observation, actions
++    )
+ 
+     params = state.params.filter(config.trainable_filter)
+     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
+@@ -186,6 +206,7 @@ def train_step(
+     )
+     info = {
+         "loss": loss,
++        **aux_info,
+         "grad_norm": optax.global_norm(grads),
+         "param_norm": optax.global_norm(kernel_params),
+     }
+diff --git a/policy/Pi_05/openpi/src/openpi/models/model.py b/policy/Pi_05/openpi/src/openpi/models/model.py
+index 29618b4..c7b9fc2 100644
+--- a/policy/Pi_05/openpi/src/openpi/models/model.py
++++ b/policy/Pi_05/openpi/src/openpi/models/model.py
+@@ -106,6 +106,14 @@ class Observation(Generic[ArrayT]):
+     # Token loss mask (for FAST autoregressive model).
+     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
+ 
++    # [pi05-history] 记忆（历史）字段：历史帧堆叠 (b, n, c, h, w) ∈ [-1,1]，history_mask (b, n)。
++    # 注意：轴名用 hh/ww（而非 h/w），避免与 images 的 h/w=224 在 jaxtyping 跨字段检查时冲突（history 为 128×128）。
++    history_images: at.Float[ArrayT, "*b n c hh ww"] | None = None
++    history_mask: at.Bool[ArrayT, "*b n"] | None = None
++
++    # [pi05-keyframe] Phase 8：训练样本权重 (b,)（关键帧加权；None = 不加权，等价旧行为）。
++    loss_weight: at.Float[ArrayT, "*b"] | None = None
++
+     @classmethod
+     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
+         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
+@@ -118,6 +126,14 @@ class Observation(Generic[ArrayT]):
+                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
+             elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
+                 data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
++        # [pi05-history] history 帧与图像同规则：uint8 → [-1,1] float32。
++        if data.get("history_images") is not None:
++            history = data["history_images"]
++            if hasattr(history, "dtype") and history.dtype == np.uint8:
++                history = history.astype(np.float32) / 255.0 * 2.0 - 1.0
++            elif hasattr(history, "dtype") and history.dtype == torch.uint8:
++                history = history.to(torch.float32) / 255.0 * 2.0 - 1.0
++            data["history_images"] = history
+         return cls(
+             images=data["image"],
+             image_masks=data["image_mask"],
+@@ -126,6 +142,9 @@ class Observation(Generic[ArrayT]):
+             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
+             token_ar_mask=data.get("token_ar_mask"),
+             token_loss_mask=data.get("token_loss_mask"),
++            history_images=data.get("history_images"),
++            history_mask=data.get("history_mask"),
++            loss_weight=data.get("loss_weight"),
+         )
+ 
+     def to_dict(self) -> at.PyTree[ArrayT]:
+@@ -197,6 +216,14 @@ def preprocess_observation(
+         else:
+             out_masks[key] = jnp.asarray(observation.image_masks[key])
+ 
++    # [pi05-history] 透传 history 帧；分辨率不一致时按帧 resize（数据侧允许 CHW/HWC 之前先转 HWC）。
++    out_history = observation.history_images
++    if out_history is not None and out_history.shape[-2:] != tuple(image_resolution):
++        b, n, c = out_history.shape[:3]
++        flat = jnp.transpose(out_history.reshape(b * n, c, *out_history.shape[3:]), (0, 2, 3, 1))
++        flat = image_tools.resize_with_pad(flat, *image_resolution)
++        flat = jnp.transpose(flat, (0, 3, 1, 2))
++        out_history = flat.reshape(b, n, c, *image_resolution)
+     return Observation(
+         images=out_images,
+         image_masks=out_masks,
+@@ -205,6 +232,8 @@ def preprocess_observation(
+         tokenized_prompt_mask=observation.tokenized_prompt_mask,
+         token_ar_mask=observation.token_ar_mask,
+         token_loss_mask=observation.token_loss_mask,
++        history_images=out_history,
++        history_mask=observation.history_mask,
+     )
+ 
+ 
+@@ -236,6 +265,30 @@ class BaseModelConfig(abc.ABC):
+         graphdef, state = nnx.split(model)
+         if remove_extra_params:
+             params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
++        # [pi05-history] 检查点缺失的 history 参数（history projector）就地随机初始化。
++        # 仅当模型开启历史通路（history_slots>0）时启用；默认 history_slots=0 时走原路径，
++        # 行为与改动前完全一致。其余缺失参数不在白名单内，仍由 check_pytree_equality 报错。
++        if getattr(self, "history_slots", 0) > 0:
++            flat_state = traverse_util.flatten_dict(state.to_pure_dict(), sep="/")
++            flat_params = dict(traverse_util.flatten_dict(params, sep="/"))
++            for _key, _leaf in flat_state.items():
++                if _key in flat_params or "history" not in _key:
++                    continue
++                # [pi05-history] 补齐缺失的 history 参数（投影层等），保持与 create() 一致的零初始化
++                # （Phase 5 关键技巧 1：step 0 历史通道输出为 0）。
++                # [pi05-history] Phase 9：history_inject=proj_identity 时投影核用恒等初始化补齐，
++                # 与 Pi0.__init__ 的 _identity_kernel_init 一致（否则会把直注路径退化成零初始化瓶颈）。
++                if (
++                    getattr(self, "history_inject", "proj_zero") == "proj_identity"
++                    and _key.endswith("history_proj/kernel")
++                    and len(_leaf.shape) == 2
++                ):
++                    _eye = jnp.zeros(_leaf.shape, _leaf.dtype)
++                    _n = min(_leaf.shape)
++                    flat_params[_key] = _eye.at[jnp.arange(_n), jnp.arange(_n)].set(1.0)
++                else:
++                    flat_params[_key] = jnp.zeros(_leaf.shape, _leaf.dtype)
++            params = traverse_util.unflatten_dict(flat_params, sep="/")
+         at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
+         state.replace_by_pure_dict(params)
+         return nnx.merge(graphdef, state)
+diff --git a/policy/Pi_05/openpi/src/openpi/models/pi0.py b/policy/Pi_05/openpi/src/openpi/models/pi0.py
+index ae7c459..2b0522c 100644
+--- a/policy/Pi_05/openpi/src/openpi/models/pi0.py
++++ b/policy/Pi_05/openpi/src/openpi/models/pi0.py
+@@ -16,6 +16,15 @@ from openpi.shared import array_typing as at
+ logger = logging.getLogger("openpi")
+ 
+ 
++def _identity_kernel_init(rng, shape, dtype=jnp.float32):
++    """[pi05-history] Phase 9：恒等初始化（nnx.Linear kernel 形状 = (in, out)）。"""
++    del rng  # 恒等初始化与随机数无关（签名需与 flax initializer 一致：key, shape, dtype）
++    in_features, out_features = shape[0], shape[1]
++    kernel = jnp.zeros((in_features, out_features), dtype=dtype)
++    n = min(in_features, out_features)
++    return kernel.at[jnp.arange(n), jnp.arange(n)].set(1.0)
++
++
+ def make_attn_mask(input_mask, mask_ar):
+     """Adapted from big_vision.
+ 
+@@ -99,6 +108,42 @@ class Pi0(_model.BaseModel):
+             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+ 
++        # [pi05-history] 历史（记忆）通路：SigLIP 输出 → 池化 → 线性投影 → 前缀 token。
++        self.history_slots = config.history_slots
++        self.history_tokens_per_slot = config.history_tokens_per_slot
++        self.history_pool_size = config.history_pool_size
++        # [pi05-contrast] Phase 9 内容对比辅助损失开关（默认 none = 完全关闭，行为与旧版一致）。
++        self.contrast_mode = getattr(config, "contrast_mode", "none")
++        self.contrast_margin_rel = float(getattr(config, "contrast_margin_rel", 0.1))
++        self.contrast_weight = float(getattr(config, "contrast_weight", 1.0))
++        self.contrast_batch_frac = float(getattr(config, "contrast_batch_frac", 0.5))
++        self.contrast_stop_grad = bool(getattr(config, "contrast_stop_grad", True))
++        # [pi05-history] Phase 9 写侧注入方式（history_inject）：
++        #   proj_zero     = 旧行为（可训 Linear，零初始化；step 0 输出 0）；
++        #   proj_identity = 可训 Linear，恒等初始化（step 0 输出 = 池化特征，直注但保留可塑性）；
++        #   direct        = 不建投影，池化特征直接当前缀 embedding（对齐 DM0.5 的冻结特征直注）。
++        self.history_inject = getattr(config, "history_inject", "proj_zero")
++        if config.history_slots > 0 and self.history_inject != "direct":
++            if self.history_inject == "proj_identity":
++                self.history_proj = nnx.Linear(
++                    paligemma_config.width,
++                    paligemma_config.width,
++                    kernel_init=_identity_kernel_init,
++                    bias_init=nnx.initializers.zeros_init(),
++                    rngs=rngs,
++                )
++            else:
++                # 输出零初始化（kernel/bias 全 0）：step 0 历史 token 输出为 0，等价于
++                # "可学习 scale 初值 0"（Phase 5 关键技巧 1），训练中由梯度逐步"打开"历史通道，
++                # 避免随机初始化的历史 token 一开始就污染已收敛的前缀分布。
++                self.history_proj = nnx.Linear(
++                    paligemma_config.width,
++                    paligemma_config.width,
++                    kernel_init=nnx.initializers.zeros_init(),
++                    bias_init=nnx.initializers.zeros_init(),
++                    rngs=rngs,
++                )
++
+         # This attribute gets automatically set by model.train() and model.eval().
+         self.deterministic = True
+ 
+@@ -124,6 +169,31 @@ class Pi0(_model.BaseModel):
+             # image tokens attend to each other
+             ar_mask += [False] * image_tokens.shape[1]
+ 
++        # [pi05-history] history 帧：SigLIP → 16×16 → 自适应池化 → Linear；pad 槽 input_mask=0。
++        if self.history_slots > 0 and obs.history_images is not None:
++            _history = obs.history_images  # (b, n, c, h, w)
++            _hb, _hn = _history.shape[0], _history.shape[1]
++            _flat = jnp.transpose(_history.reshape(_hb * _hn, *_history.shape[2:]), (0, 2, 3, 1))
++            _hist_tokens, _ = self.PaliGemma.img(_flat, train=False)  # (b*n, s, width)
++            _side = int(round(_hist_tokens.shape[1] ** 0.5))
++            _pool = max(1, _side // self.history_pool_size)
++            _hist_tokens = _hist_tokens.reshape(_hb, _hn, _side, _side, _hist_tokens.shape[-1])
++            _hist_tokens = _hist_tokens.reshape(
++                _hb, _hn, self.history_pool_size, _pool, self.history_pool_size, _pool, _hist_tokens.shape[-1]
++            ).mean(axis=(3, 5))
++            _hist_tokens = _hist_tokens.reshape(_hb, _hn * self.history_tokens_per_slot, -1)
++            if self.history_inject == "direct":
++                # [pi05-history] Phase 9：冻结特征直注（无投影、无瓶颈）。
++                tokens.append(_hist_tokens)
++            else:
++                tokens.append(self.history_proj(_hist_tokens))
++            _hist_mask = obs.history_mask
++            if _hist_mask is None:
++                _hist_mask = jnp.ones((_hb, _hn), dtype=jnp.bool_)
++            input_mask.append(einops.repeat(_hist_mask, "b n -> b (n k)", k=self.history_tokens_per_slot))
++            # history tokens attend to each other (same rule as image tokens)
++            ar_mask += [False] * (_hn * self.history_tokens_per_slot)
++
+         # add language (aka tokenized inputs)
+         if obs.tokenized_prompt is not None:
+             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+@@ -189,6 +259,27 @@ class Pi0(_model.BaseModel):
+     def compute_loss(
+         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+     ) -> at.Float[at.Array, "*b ah"]:
++        observation, x_t, u_t, time = self._prepare_loss_inputs(rng, observation, actions, train=train)
++        return self._action_loss(observation, x_t, u_t, time)
++
++    def _prepare_loss_inputs(
++        self,
++        rng: at.KeyArrayLike,
++        observation: _model.Observation,
++        actions: _model.Actions,
++        *,
++        train: bool,
++    ) -> tuple[
++        _model.Observation,
++        at.Float[at.Array, "*b ah ad"],
++        at.Float[at.Array, "*b ah ad"],
++        at.Float[at.Array, "*b"],
++    ]:
++        """[pi05-contrast] Phase 9：预处理 + 流匹配加噪（同一 rng 下可与 compute_loss 逐位复现）。
++
++        compute_loss 与 compute_contrast_aux 都以各自收到的 rng 为种子，因此只要传入同一个 rng，
++        两条路径的预处理/噪声/时间完全一致——对比损失才是在"同一批噪声"上比较。
++        """
+         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+ 
+@@ -198,6 +289,17 @@ class Pi0(_model.BaseModel):
+         time_expanded = time[..., None, None]
+         x_t = time_expanded * noise + (1 - time_expanded) * actions
+         u_t = noise - actions
++        return observation, x_t, u_t, time
++
++    @at.typecheck
++    def _action_loss(
++        self,
++        observation: _model.Observation,
++        x_t: at.Float[at.Array, "*b ah ad"],
++        u_t: at.Float[at.Array, "*b ah ad"],
++        time: at.Float[at.Array, "*b"],
++    ) -> at.Float[at.Array, "*b ah"]:
++        """单次 prefix+suffix 前向的 flow-matching loss（与改动前 compute_loss 主体逐行一致）。"""
+ 
+         # one big forward pass of prefix + suffix at once
+         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+@@ -213,6 +315,66 @@ class Pi0(_model.BaseModel):
+ 
+         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+ 
++    @property
++    def contrast_enabled(self) -> bool:
++        """[pi05-contrast] Phase 9：内容对比辅助损失是否开启（默认 False = 与旧版逐位一致）。"""
++        return self.contrast_mode != "none" and self.history_slots > 0
++
++    def compute_contrast_aux(
++        self,
++        rng: at.KeyArrayLike,
++        observation: _model.Observation,
++        actions: _model.Actions,
++        per_sample_loss: at.Float[at.Array, "*b"],
++        *,
++        train: bool = False,
++    ) -> dict[str, at.Float[at.Array, ""]]:
++        """[pi05-contrast] Phase 9：内容对比辅助损失 max(0, margin − (loss_roll − loss_on))。
++
++        * ``loss_on``   = 主 loss（由调用方传入 per-sample 均值，形状 (b,)，与训练主 loss 同一批噪声/时间）；
++        * ``loss_roll`` = 同 batch 内 roll=1 的错位历史（等价离线门禁的 croll 臂）重算的 flow-matching loss；
++        * margin = ``contrast_margin_rel`` × 当日 batch 的 on-loss 均值（stop_gradient，避免尺度漂移）；
++        * ``contrast_stop_grad=True`` 时 roll 分支不反传：辅助项的作用是"把用错内容也不变差的样本权重加大"，
++          即自动版的关键帧加权；False 时同时把"错内容必须更差"也写进目标（对抗式）。
++        * 只对前 k=round(b×contrast_batch_frac) 个样本计算（省算力），其余样本 aux=0。
++
++        返回的 dict 全部是标量（用于训练日志）；关闭时返回全 0，梯度贡献为零。
++        """
++        zero = jnp.zeros((), jnp.float32)
++        info: dict[str, at.Float[at.Array, ""]] = {
++            "contrast_aux": zero,
++            "contrast_hinge_frac": zero,
++            "contrast_gap": zero,
++            "contrast_margin": zero,
++        }
++        if not self.contrast_enabled or observation.history_images is None:
++            return info
++
++        obs, x_t, u_t, time = self._prepare_loss_inputs(rng, observation, actions, train=train)
++        batch_size = x_t.shape[0]
++        k = max(1, min(batch_size, int(round(batch_size * self.contrast_batch_frac))))
++        rolled = obs.replace(history_images=jnp.roll(obs.history_images, 1, axis=0))
++        if k < batch_size:
++            rolled = jax.tree.map(lambda leaf: leaf[:k], rolled)
++        loss_roll = self._action_loss(rolled, x_t[:k], u_t[:k], time[:k])
++
++        # 逐样本比较（batch 级均值会被"本来就无关内容"的样本稀释掉，失去选择性）。
++        on_per = per_sample_loss[:k]
++        roll_per = jnp.mean(loss_roll, axis=-1)
++        if self.contrast_stop_grad:
++            roll_per = jax.lax.stop_gradient(roll_per)
++        margin = jax.lax.stop_gradient(jnp.mean(on_per)) * self.contrast_margin_rel
++        hinge = jnp.maximum(0.0, margin - (roll_per - on_per))
++        info = {
++            # 归一化到"全 batch 平均"：逐样本梯度为 on 侧 (1−β)/b、roll 侧 β/b，
++            # 因此 β<1 时 on 侧永远是下降方向（不会出现"为了拉大 gap 而抬高 on-loss"的反向）。
++            "contrast_aux": self.contrast_weight * jnp.sum(hinge) / batch_size,
++            "contrast_hinge_frac": jnp.mean((hinge > 0).astype(jnp.float32)),
++            "contrast_gap": jax.lax.stop_gradient(jnp.mean(roll_per - on_per)),
++            "contrast_margin": margin,
++        }
++        return info
++
+     @override
+     def sample_actions(
+         self,
+diff --git a/policy/Pi_05/openpi/src/openpi/models/pi0_config.py b/policy/Pi_05/openpi/src/openpi/models/pi0_config.py
+index 584d83f..57de0f9 100644
+--- a/policy/Pi_05/openpi/src/openpi/models/pi0_config.py
++++ b/policy/Pi_05/openpi/src/openpi/models/pi0_config.py
+@@ -32,6 +32,32 @@ class Pi0Config(_model.BaseModelConfig):
+     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
+     discrete_state_input: bool = None  # type: ignore
+ 
++    # [pi05-history] 记忆/历史通路（0 = 关闭；官方 checkpoint 缺 history projector 时随机初始化）。
++    history_slots: int = 0
++    history_tokens_per_slot: int = 16
++    history_pool_size: int = 4
++    # [pi05-history] 是否额外冻结 SigLIP 视觉塔（保持当前帧特征不动；history 通路不受影响）。
++    freeze_vision_tower: bool = False
++    # [pi05-history] Phase 9 写侧注入方式（去掉"零初始化瓶颈"）：
++    #   proj_zero     = 旧行为：可训 Linear + 零初始化（step 0 输出 0，训练中逐步打开）；
++    #   proj_identity = 可训 Linear + 恒等初始化（step 0 输出 = 池化特征，等价直注但保留可塑性）；
++    #   direct        = 不建投影，池化后的冻结 SigLIP 特征直接当前缀 embedding（对齐 DM0.5 直注）。
++    history_inject: str = "proj_zero"
++
++    # [pi05-contrast] Phase 9 内容对比辅助损失：max(0, margin − (loss_roll − loss_on))。
++    # roll = 同 batch 内 roll=1 的错位历史（与离线门禁 croll 臂同口径）。
++    #   contrast_mode: none（默认关闭）| roll
++    #   contrast_margin_rel: margin = 相对量 × 当日 batch 的 on-loss 均值
++    #   contrast_weight: 辅助项权重（加到主 loss 上）
++    #   contrast_batch_frac: 只用前 k=round(b*frac) 个样本算 roll 分支（省算力；其余样本 aux=0）
++    #   contrast_stop_grad: True = roll 分支不反传（只把"用错内容时更好"的样本权重加大）；
++    #                       False = 同时把"用错内容 loss 抬高"也写进目标（对抗式）。
++    contrast_mode: str = "none"
++    contrast_margin_rel: float = 0.1
++    contrast_weight: float = 0.5
++    contrast_batch_frac: float = 0.5
++    contrast_stop_grad: bool = True
++
+     pytorch_compile_mode: str | None = "max-autotune"
+ 
+     def __post_init__(self):
+@@ -46,6 +72,15 @@ class Pi0Config(_model.BaseModelConfig):
+                 "max-autotune",
+                 "max-autotune-no-cudagraphs",
+             ]
++        # [pi05-history] Phase 9 开关校验（默认值与原行为完全一致）。
++        assert self.history_inject in ("proj_zero", "proj_identity", "direct"), self.history_inject
++        assert self.contrast_mode in ("none", "roll"), self.contrast_mode
++        if self.contrast_mode != "none":
++            assert self.history_slots > 0, "contrast 需要 history_slots > 0"
++            assert 0.0 < self.contrast_batch_frac <= 1.0, self.contrast_batch_frac
++            assert self.contrast_margin_rel >= 0.0, self.contrast_margin_rel
++            # β<1：保证 on 分支始终是下降方向（β≥1 会把"当前内容"的 loss 反向抬高）。
++            assert 0.0 <= self.contrast_weight < 1.0, self.contrast_weight
+ 
+     @property
+     @override
+@@ -112,6 +147,9 @@ class Pi0Config(_model.BaseModelConfig):
+             filters.append(
+                 nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+             )
+-        if not filters:
+-            return nnx.Nothing
+-        return nnx.All(*filters)
++        base_filter = nnx.All(*filters) if filters else nnx.Nothing
++        if not self.freeze_vision_tower:
++            return base_filter
++        # [pi05-history] 追加冻结视觉塔（.*img.*）。注意必须用 Any 并集，不能塞进 All。
++        vision_filter = nnx_utils.PathRegex(".*img.*")
++        return vision_filter if not filters else nnx.Any(base_filter, vision_filter)
+diff --git a/policy/Pi_05/openpi/src/openpi/policies/aloha_policy.py b/policy/Pi_05/openpi/src/openpi/policies/aloha_policy.py
+index 94d7064..ddb13e8 100644
+--- a/policy/Pi_05/openpi/src/openpi/policies/aloha_policy.py
++++ b/policy/Pi_05/openpi/src/openpi/policies/aloha_policy.py
+@@ -43,13 +43,26 @@ class AlohaInputs(transforms.DataTransformFn):
+ 
+     # The expected cameras names. All input cameras must be in this set. Missing cameras will be
+     # replaced with black images and the corresponding `image_mask` will be set to False.
+-    EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("cam_high", "cam_low", "cam_left_wrist", "cam_right_wrist")
++    # [pi05-history] cam_history = B1 拼贴图（可选第 4 路图像；缺省不注入以保持基线前缀不变）
++    EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = (
++        "cam_high",
++        "cam_low",
++        "cam_left_wrist",
++        "cam_right_wrist",
++        "cam_history",
++    )
+ 
+     def __call__(self, data: dict) -> dict:
+         data = _decode_aloha(data, adapt_to_pi=self.adapt_to_pi)
+ 
+         in_images = data["images"]
+-        if set(in_images) - set(self.EXPECTED_CAMERAS):
++        # [pi05-history] B2 多帧多图：cam_history_<i> 为可选历史图键，按前缀放行。
++        unexpected = {
++            name
++            for name in in_images
++            if name not in self.EXPECTED_CAMERAS and not name.startswith("cam_history")
++        }
++        if unexpected:
+             raise ValueError(f"Expected images to contain {self.EXPECTED_CAMERAS}, got {tuple(in_images)}")
+ 
+         # Assume that base image always exists.
+@@ -75,6 +88,22 @@ class AlohaInputs(transforms.DataTransformFn):
+                 images[dest] = np.zeros_like(base_image)
+                 image_masks[dest] = _make_image_mask(base_image, False)
+ 
++        # [pi05-history] B1 拼贴图：仅在调用方提供 cam_history 时注入第 4 路图像；
++        # 缺省不注入，保证无历史时的前缀长度与官方基线完全一致。
++        if "cam_history" in in_images:
++            images["history_0_rgb"] = in_images["cam_history"]
++            image_masks["history_0_rgb"] = _make_image_mask(in_images["cam_history"], True)
++
++        # [pi05-history] B2 多帧多图：cam_history_<i> → history_<i>_rgb（按索引升序，最旧在前）。
++        history_keys = sorted(
++            (name for name in in_images if name.startswith("cam_history_")),
++            key=lambda name: int(name.rsplit("_", 1)[-1]),
++        )
++        for name in history_keys:
++            index = int(name.rsplit("_", 1)[-1])
++            images[f"history_{index}_rgb"] = in_images[name]
++            image_masks[f"history_{index}_rgb"] = _make_image_mask(in_images[name], True)
++
+         inputs = {
+             "image": images,
+             "image_mask": image_masks,
+@@ -90,6 +119,11 @@ class AlohaInputs(transforms.DataTransformFn):
+         if "prompt" in data:
+             inputs["prompt"] = data["prompt"]
+ 
++        # [pi05-history] 透传数据集索引，供 RoboDojoHistoryTransform 反查 sidecar（键缺省时行为不变）。
++        for _key in ("episode_index", "frame_index", "task_index"):
++            if _key in data:
++                inputs[_key] = data[_key]
++
+         return inputs
+ 
+ 
+diff --git a/policy/Pi_05/openpi/src/openpi/policies/policy.py b/policy/Pi_05/openpi/src/openpi/policies/policy.py
+index 7154530..fb426b7 100644
+--- a/policy/Pi_05/openpi/src/openpi/policies/policy.py
++++ b/policy/Pi_05/openpi/src/openpi/policies/policy.py
+@@ -70,6 +70,14 @@ class Policy(BasePolicy):
+         inputs = jax.tree.map(lambda x: x, obs)
+         inputs = self._input_transform(inputs)
+ 
++        # [pi05-history] 以评测侧（服务器 _attach_history）的 history_* 为准：history 训练配置自带的
++        # RoboDojoHistoryTransform 在无 episode_index/frame_index 时会写入全 pad + mask=False，
++        # 必须用 obs 里的真实历史覆盖，否则模型读不到记忆（Phase 6 冒烟实测 Δ=0.0 的根因）。
++        if isinstance(obs, dict):
++            for _history_key in ("history_images", "history_mask"):
++                if _history_key in obs:
++                    inputs[_history_key] = obs[_history_key]
++
+         is_batched = False
+         if "state" in inputs:
+             is_batched = np.asarray(inputs["state"]).ndim > 1
+diff --git a/policy/Pi_05/openpi/src/openpi/training/config.py b/policy/Pi_05/openpi/src/openpi/training/config.py
+index c6babbc..a73b508 100644
+--- a/policy/Pi_05/openpi/src/openpi/training/config.py
++++ b/policy/Pi_05/openpi/src/openpi/training/config.py
+@@ -4,7 +4,9 @@ import abc
+ from collections.abc import Sequence
+ import dataclasses
+ import difflib
++import json
+ import logging
++import os
+ import pathlib
+ from typing import Any, Literal, Protocol, TypeAlias
+ 
+@@ -20,6 +22,7 @@ import openpi.models.tokenizer as _tokenizer
+ import openpi.policies.aloha_policy as aloha_policy
+ import openpi.policies.droid_policy as droid_policy
+ import openpi.policies.libero_policy as libero_policy
++import openpi.policies.robodojo_history as robodojo_history
+ import openpi.policies.wuji_policy as wuji_policy
+ import openpi.shared.download as _download
+ import openpi.shared.normalize as _normalize
+@@ -34,6 +37,43 @@ import openpi.transforms as _transforms
+ _ROBODOJO_ASSETS_DIR = pathlib.Path(__file__).resolve().parents[3] / "assets" / "RoboDojo_assets"
+ # Norm stats for Tianji Marvin + Wuji Hand (written by compute_norm_stats).
+ _WUJI_ASSETS_DIR = pathlib.Path(__file__).resolve().parents[3] / "assets" / "Wuji_assets"
++# Repository-relative defaults keep the training config portable across checkouts.
++_PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[8]
++_PI05_POLICY_DIR = pathlib.Path(__file__).resolve().parents[4]
++# [pi05-history] Phase 4 生成的历史帧 sidecar 根目录（env 可覆盖）；默认关闭的配置不会读取。
++_ROBODOJO_HISTORY_SIDECAR_DIR = os.environ.get(
++    "ROBODOJO_HISTORY_SIDECAR_DIR",
++    str(_PROJECT_ROOT / "robodojo" / "data" / "history_sidecar"),
++)
++_ROBODOJO_BASE_CHECKPOINT = os.environ.get(
++    "ROBODOJO_PI05_BASE_CHECKPOINT",
++    str(_PI05_POLICY_DIR / "checkpoints" / "RoboDojo-sim-arx_x5-joint-2" / "59999" / "params"),
++)
++
++
++def _load_history_cotrain_episodes() -> tuple[int, ...] | None:
++    """[pi05-history] 读取 Phase 5 cotrain 混采清单（mem6 : 通用 ≈1:1，帧级）。
++
++    文件缺失时返回 None（回退全量数据），保证其它机器/评测链路 import 不受影响。
++    """
++    _path = pathlib.Path(_ROBODOJO_HISTORY_SIDECAR_DIR) / "cotrain_mix_episodes.json"
++    try:
++        _payload = json.loads(_path.read_text())
++        _episodes = tuple(int(e) for e in _payload["episodes"])
++        logging.getLogger(__name__).info("history cotrain mix: %d episodes from %s", len(_episodes), _path)
++        return _episodes
++    except FileNotFoundError:
++        logging.getLogger(__name__).warning("history cotrain mix not found: %s; fallback to full dataset", _path)
++        return None
++
++
++_ROBODOJO_HISTORY_COTRAIN_EPISODES = _load_history_cotrain_episodes()
++
++# [pi05-keyframe] Phase 8：关键帧权重表（表缺失 = transform 不输出 loss_weight，行为与旧版一致）。
++_ROBODOJO_KEYFRAME_WEIGHTS = os.environ.get(
++    "ROBODOJO_KEYFRAME_WEIGHTS",
++    str(pathlib.Path(_ROBODOJO_HISTORY_SIDECAR_DIR) / "keyframe_weights_v1.json"),
++)
+ 
+ ModelType: TypeAlias = _model.ModelType
+ # Work around a tyro issue with using nnx.filterlib.Filter directly.
+@@ -71,6 +111,12 @@ class AssetsConfig:
+ class DataConfig:
+     # LeRobot repo id. If None, fake data will be created.
+     repo_id: str | None = None
++    # [pi05-history] 可选：只使用这些 episode_index 训练（None = 全量）。
++    # Phase 5 cotrain 混采（mem6 : 通用 ≈ 1:1）通过该字段实现。
++    episodes: Sequence[int] | None = None
++    # [pi05-history] 视频帧时间戳容差（秒）。lerobot 默认 1e-4 过严，个别 episode 边界帧
++    # 与视频帧网格相差 1 帧（0.04s@25fps）会直接抛 FrameTimestampError；history 配置用 0.05。
++    tolerance_s: float = 0.0001
+     # Video decoder backend for LeRobot datasets. Forced to pyav by default because
+     # torchcodec is present in some environments but not fully functional at runtime.
+     video_backend: Literal["pyav", "torchcodec", "video_reader"] = "pyav"
+@@ -263,6 +309,15 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
+     # Action keys that will be used to read the action sequence from the dataset.
+     action_sequence_keys: Sequence[str] = ("action",)
+ 
++    # [pi05-history] 历史帧 sidecar 根目录（build_history_sidecar.py 输出）；None = 完全关闭（默认）。
++    history_sidecar_root: str | None = None
++    # [pi05-history] 历史抽帧间隔（帧）：25 → 1 Hz@25fps；需与 sidecar 构建侧一致。
++    history_interval: int = 25
++    # [pi05-keyframe] Phase 8：关键帧权重表路径；None = 不做样本加权（默认，等价旧行为）。
++    keyframe_weights_path: str | None = None
++    # [pi05-history] Phase 9：pad 槽处理方式，透传给 RoboDojoHistoryTransform（默认 zero = 旧行为）。
++    history_pad_mode: str = "zero"
++
+     @override
+     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+         data_transforms = _transforms.Group(
+@@ -275,6 +330,22 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
+                 inputs=[_transforms.DeltaActions(delta_action_mask)],
+                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+             )
++        # [pi05-history] 历史帧 transform：仅显式配置 sidecar 根目录时挂载（默认关闭）。
++        if self.history_sidecar_root is not None:
++            slots = int(getattr(model_config, "history_slots", 0) or 0)
++            if slots <= 0:
++                raise ValueError("history_sidecar_root 需要 model.history_slots > 0")
++            data_transforms = data_transforms.push(
++                inputs=[
++                    robodojo_history.RoboDojoHistoryTransform(
++                        sidecar_root=self.history_sidecar_root,
++                        slots=slots,
++                        interval=self.history_interval,
++                        keyframe_weights_path=self.keyframe_weights_path,
++                        pad_mode=self.history_pad_mode,
++                    )
++                ],
++            )
+ 
+         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+ 
+@@ -737,6 +808,198 @@ _CONFIGS = [
+         fsdp_devices=2,
+         num_train_steps=60000,
+     ),
++    # [pi05-history] Phase 5C 训练目标：冻结主干 + LoRA，history projector 全参可训（附录 C）。
++    # 数据 = Phase 4 sidecar（mem6 有历史；无 sidecar 的样本自动 pad + mask=False，供 cotrain）。
++    TrainConfig(
++        name="pi05_aloha_sim_history_arx-x5_seed_0",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            paligemma_variant="gemma_2b_lora",
++            history_slots=20,
++            history_tokens_per_slot=16,
++            history_pool_size=4,
++            freeze_vision_tower=True,
++        ),
++        data=LeRobotAlohaDataConfig(
++            repo_id="RoboDojo_sim_arx-x5_v30_history",
++            assets=AssetsConfig(
++                assets_dir=str(_ROBODOJO_ASSETS_DIR),
++                asset_id="arx_x5_sim",
++            ),
++            repack_transforms=_transforms.Group(
++                inputs=[
++                    _transforms.RepackTransform(
++                        {
++                            "images": {
++                                "cam_high": "observation.images.cam_high",
++                                "cam_left_wrist": "observation.images.cam_left_wrist",
++                                "cam_right_wrist": "observation.images.cam_right_wrist",
++                            },
++                            "state": "observation.state",
++                            "actions": "action",
++                            "prompt": "prompt",
++                            "episode_index": "episode_index",
++                            "frame_index": "frame_index",
++                        }
++                    )
++                ]
++            ),
++            history_sidecar_root=_ROBODOJO_HISTORY_SIDECAR_DIR,
++            base_config=DataConfig(
++                prompt_from_task=True,
++                episodes=_ROBODOJO_HISTORY_COTRAIN_EPISODES,
++                tolerance_s=0.05,
++            ),
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader(
++            _ROBODOJO_BASE_CHECKPOINT,
++            missing_regex=".*lora.*|.*history.*",
++        ),
++        # 5C 冻结口径：VLM (Gemma) 主干冻结（LoRA 可训）、SigLIP 视觉塔冻结、action expert 全参可训、
++        # history projector 全参可训。注意 TrainConfig.freeze_filter 默认是 Nothing（不冻结），必须显式传。
++        freeze_filter=pi0_config.Pi0Config(
++            pi05=True,
++            paligemma_variant="gemma_2b_lora",
++            freeze_vision_tower=True,
++        ).get_freeze_filter(),
++        # LoRA 微调关闭 EMA（对齐上游惯例；同时避免全量 EMA 副本带来的额外显存）。
++        ema_decay=None,
++        seed=0,
++        batch_size=128,
++        fsdp_devices=2,
++        num_train_steps=20000,
++    ),
++    # [pi05-keyframe] Phase 8：与 history 版同配方，额外挂"关键帧权重表"做样本加权
++    # （Σ wᵢℓᵢ/Σ wᵢ；mem6 关键帧 w>1，通用帧/未列出 episode 默认 w=1）。
++    # 表路径默认 keyframe_weights_v1.json，可用环境变量 ROBODOJO_KEYFRAME_WEIGHTS 覆盖（v1→v2 切换）。
++    TrainConfig(
++        name="pi05_aloha_sim_history_kf_arx-x5_seed_0",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            paligemma_variant="gemma_2b_lora",
++            history_slots=20,
++            history_tokens_per_slot=16,
++            history_pool_size=4,
++            freeze_vision_tower=True,
++        ),
++        data=LeRobotAlohaDataConfig(
++            repo_id="RoboDojo_sim_arx-x5_v30_history",
++            assets=AssetsConfig(
++                assets_dir=str(_ROBODOJO_ASSETS_DIR),
++                asset_id="arx_x5_sim",
++            ),
++            repack_transforms=_transforms.Group(
++                inputs=[
++                    _transforms.RepackTransform(
++                        {
++                            "images": {
++                                "cam_high": "observation.images.cam_high",
++                                "cam_left_wrist": "observation.images.cam_left_wrist",
++                                "cam_right_wrist": "observation.images.cam_right_wrist",
++                            },
++                            "state": "observation.state",
++                            "actions": "action",
++                            "prompt": "prompt",
++                            "episode_index": "episode_index",
++                            "frame_index": "frame_index",
++                        }
++                    )
++                ]
++            ),
++            history_sidecar_root=_ROBODOJO_HISTORY_SIDECAR_DIR,
++            keyframe_weights_path=_ROBODOJO_KEYFRAME_WEIGHTS,
++            base_config=DataConfig(
++                prompt_from_task=True,
++                episodes=_ROBODOJO_HISTORY_COTRAIN_EPISODES,
++                tolerance_s=0.05,
++            ),
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader(
++            _ROBODOJO_BASE_CHECKPOINT,
++            missing_regex=".*lora.*|.*history.*",
++        ),
++        freeze_filter=pi0_config.Pi0Config(
++            pi05=True,
++            paligemma_variant="gemma_2b_lora",
++            freeze_vision_tower=True,
++        ).get_freeze_filter(),
++        ema_decay=None,
++        seed=0,
++        batch_size=128,
++        fsdp_devices=2,
++        num_train_steps=20000,
++    ),
++    # [pi05-history] Phase 9 训练目标：5C-LoRA 配方 + 三个"内容通道"开关（全部为新增项，默认关闭）：
++    #   ① history_pad_mode="repeat_oldest"：左侧空槽用最旧有效帧回填、mask 全 True —— 切断
++    #      "可见槽位数 = 剧集时钟"这条捷径（Phase 8 已证实模型在用 mask 当时间码）；
++    #   ② history_inject="proj_identity"：写侧投影恒等初始化 —— step 0 即等价"冻结特征直注"
++    #      （对齐 DM0.5），摘掉零初始化瓶颈（旧配置 history_proj 每元素 rms 仅 1.9e-3，比同类投影小 14 倍）；
++    #   ③ contrast_mode="roll"：内容对比辅助损失 max(0, margin − (loss_roll − loss_on))，margin=10% on-loss，
++    #      β=0.5（stop_grad=False：既压低"真内容"的 loss，也抬高"错内容"的 loss，直接制造内容敏感度）。
++    # 其余口径（LoRA rank16/α16、action expert 全参、SigLIP 冻结、数据/权重来源）与 5C 完全一致。
++    TrainConfig(
++        name="pi05_aloha_sim_history_v2_arx-x5_seed_0",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            paligemma_variant="gemma_2b_lora",
++            history_slots=20,
++            history_tokens_per_slot=16,
++            history_pool_size=4,
++            freeze_vision_tower=True,
++            history_inject="proj_identity",
++            contrast_mode="roll",
++            contrast_margin_rel=0.1,
++            contrast_weight=0.5,
++            contrast_batch_frac=0.5,
++            contrast_stop_grad=False,
++        ),
++        data=LeRobotAlohaDataConfig(
++            repo_id="RoboDojo_sim_arx-x5_v30_history",
++            assets=AssetsConfig(
++                assets_dir=str(_ROBODOJO_ASSETS_DIR),
++                asset_id="arx_x5_sim",
++            ),
++            repack_transforms=_transforms.Group(
++                inputs=[
++                    _transforms.RepackTransform(
++                        {
++                            "images": {
++                                "cam_high": "observation.images.cam_high",
++                                "cam_left_wrist": "observation.images.cam_left_wrist",
++                                "cam_right_wrist": "observation.images.cam_right_wrist",
++                            },
++                            "state": "observation.state",
++                            "actions": "action",
++                            "prompt": "prompt",
++                            "episode_index": "episode_index",
++                            "frame_index": "frame_index",
++                        }
++                    )
++                ]
++            ),
++            history_sidecar_root=_ROBODOJO_HISTORY_SIDECAR_DIR,
++            history_pad_mode="repeat_oldest",
++            base_config=DataConfig(
++                prompt_from_task=True,
++                episodes=_ROBODOJO_HISTORY_COTRAIN_EPISODES,
++                tolerance_s=0.05,
++            ),
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader(
++            _ROBODOJO_BASE_CHECKPOINT,
++            missing_regex=".*lora.*|.*history.*",
++        ),
++        freeze_filter=pi0_config.Pi0Config(
++            pi05=True,
++            paligemma_variant="gemma_2b_lora",
++            freeze_vision_tower=True,
++        ).get_freeze_filter(),
++        ema_decay=None,
++        seed=0,
++        batch_size=128,
++        fsdp_devices=2,
++        num_train_steps=20000,
++    ),
+     # Tianji Marvin + dual Wuji Hand Gen1 (54D). Set data.repo_id to your LeRobot dataset
+     # before compute_norm_stats / train. Skip RoboDojo process_data.py; use wuji mcap→LeRobot.
+     TrainConfig(
+diff --git a/policy/Pi_05/openpi/src/openpi/training/data_loader.py b/policy/Pi_05/openpi/src/openpi/training/data_loader.py
+index bf67dd1..7e70af2 100644
+--- a/policy/Pi_05/openpi/src/openpi/training/data_loader.py
++++ b/policy/Pi_05/openpi/src/openpi/training/data_loader.py
+@@ -150,6 +150,9 @@ def create_torch_dataset(
+             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+         },
+         video_backend=data_config.video_backend,
++        # [pi05-history] 可选 episode 过滤（Phase 5 cotrain 混采清单）。
++        episodes=None if data_config.episodes is None else list(data_config.episodes),
++        tolerance_s=data_config.tolerance_s,
+     )
+ 
+     if data_config.prompt_from_task:
+diff --git a/policy/Pi_05/openpi/src/openpi/training/weight_loaders.py b/policy/Pi_05/openpi/src/openpi/training/weight_loaders.py
+index 7c4eb37..6171061 100644
+--- a/policy/Pi_05/openpi/src/openpi/training/weight_loaders.py
++++ b/policy/Pi_05/openpi/src/openpi/training/weight_loaders.py
+@@ -46,12 +46,16 @@ class CheckpointWeightLoader(WeightLoader):
+     """
+ 
+     params_path: str
++    # 缺失键回填策略（用模型侧初始化值补齐）。默认只回填 LoRA；
++    # [pi05-history] 训练历史增强配置时需扩到 ".*lora.*|.*history.*"，让新建的 history 投影层
++    # 以零初始化进入训练（否则结构校验会因缺 history 键而失败）。
++    missing_regex: str = ".*lora.*"
+ 
+     def load(self, params: at.Params) -> at.Params:
+         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
+         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+-        # Add all missing LoRA weights.
+-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
++        # Add all missing weights that match the configured regex.
++        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
+ 
+ 
+ @dataclasses.dataclass(frozen=True)

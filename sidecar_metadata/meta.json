@@ -1,0 +1,18 @@
+{
+  "cam": "cam_high",
+  "fps": 25.0,
+  "interval_frames": 25,
+  "history_hz": 1.0,
+  "size": [
+    128,
+    128
+  ],
+  "dtype": "uint8",
+  "layout": "NCHW RGB",
+  "resize": "resize_with_pad(black)",
+  "episode_key": "episode_index",
+  "sample_k_to_frame": "local_frame = k * 25",
+  "eval_rule": "k <= frame_index // interval - 1（严格早于当前帧；最近 20 槽，最旧在左，不足左补 pad）",
+  "source_repo": "robodojo/data/RoboDojo_lerobot_v30_video",
+  "updated_at": "2026-10-04 22:40:10"
+}

@@ -1,0 +1,51 @@
+# Basic experiment configuration
+policy_name: Pi_05
+protocol: ws
+host: localhost
+bench_name: null
+task_name: null
+env_cfg_type: null
+seed: null
+eval_batch: true
+
+checkpoint_num: 19999
+result_dir: "./results/pi05/"
+obs_transform_pipeline: "xspark-v1.0"
+
+# Model / action configuration
+action_type: joint
+policy_uv_env_path: openpi
+# Must match the config used by train.sh (default OPENPI_TRAIN_CONFIG_NAME).
+# Phase 9 记忆评测：v2 配方（RoboDojo-sim-arx_x5-history-v2-lora-seed0：
+#   pad_mode=repeat_oldest + history_inject=proj_identity + contrast roll 损失）。
+train_config_name: pi05_aloha_sim_history_v2_arx-x5_seed_0
+repo_id: arx_x5_sim
+
+# Phase 6：slots 模式 = 训练侧 RoboDojoHistoryTransform 同口径（20 槽 × 128×128，1 Hz@25fps，
+# 每 25 步 1 帧、只取严格早于当前帧的样本、最旧在左、空槽 mask=False），由 Policy.infer 顶层透传
+# history_images/history_mask 给模型。启动时 Model 会断言与 train_config 逐项一致，不一致直接报错。
+# 回退官方基线复测（无记忆）：history_enabled: false + train_config_name: pi05_base_aloha_full_sim_arx-x5_seed_0
+#   + checkpoint_num: 59999（history_* 键保留不影响 false 分支）。
+history_enabled: true
+history_mode: slots
+history_image_key: cam_high
+history_slots: 20
+history_slot_size: 128
+history_fps: 1.0
+# [pi05-history] Phase 9：pad 槽处理方式，必须与 train_config_name 对应配置的
+# RoboDojoHistoryTransform.pad_mode 一致（启动时断言；zero = 旧行为，repeat_oldest = 断时钟模式）。
+history_pad_mode: repeat_oldest
+runtime_fps: 25.0
+history_action_interval: 25
+# 以下仅 Phase 3 消融（collage/multi/text）使用，slots 模式忽略。
+history_collage_frames: 4
+history_collage_size: 224
+history_multi_frames: 3
+history_captioner_model: null  # 仅 text 消融需要；填写本地模型路径，勿提交绝对路径
+history_captioner_device: cuda:0
+history_text_max_new_tokens: 48
+history_caption_prompt: >-
+  In under 20 words, list the visible objects with their colors and left/right positions.
+  Start directly with the objects, like: red cube left, blue cube center, green cylinder right.
+
+port: 6000

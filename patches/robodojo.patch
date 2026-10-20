@@ -1,0 +1,287 @@
+diff --git a/.dockerignore b/.dockerignore
+index 51ae733..9c80a8d 100644
+--- a/.dockerignore
++++ b/.dockerignore
+@@ -20,6 +20,13 @@ smoke_results/
+ docker/smoke_logs/
+ data/
+ 
++# ── Downloaded assets cache (~39 GB) ─────────────────────────────────
++# RoboDojo/.cache holds the HuggingFace repo clone; its Assets/ subtree is the
++# 39 GB sparse payload. Assets/ below already covers it through docker's
++# level-insensitive matching, but the rule is stated explicitly so the build
++# context cannot silently balloon if that ever changes.
++.cache/
++
+ # ── Assets are mounted at runtime, never baked into the image ─────────
+ Assets/
+ 
+diff --git a/env/environment/task_env.py b/env/environment/task_env.py
+index 228ddc8..dfafbae 100644
+--- a/env/environment/task_env.py
++++ b/env/environment/task_env.py
+@@ -1,5 +1,6 @@
+ from typing import Any, List
+ 
++from env.diagnostics import diag_stage
+ from env.camera_manager.camera_manager import CameraManager
+ from env.environment.base_env import BaseEnv
+ from env.robot_manager.control_manager import ControlSeq
+@@ -81,13 +82,20 @@ class TaskEnv(BaseEnv):
+             self.camera_manager.update_env_seeds(self.env_seeds)
+ 
+     def reset(self, seed: Any | None = None, options: dict[str, Any] | None = None):
++        diag_stage("task_env.reset:begin")
+         super().reset(seed=seed, options=options)
++        diag_stage("task_env.reset:after_sim_reset")
+         self.scene_manager.reload_scene()
++        diag_stage("task_env.reset:after_reload_scene")
+         self.robot_manager.reset()
++        diag_stage("task_env.reset:after_robot_reset")
+         for _ in range(300):
+             self.sim_step(render=False)
++        diag_stage("task_env.reset:after_300_physics_steps")
+         self.camera_manager.reset()
++        diag_stage("task_env.reset:after_camera_reset")
+         self.capture_manager.reset()
++        diag_stage("task_env.reset:done")
+ 
+     def step(self, meta_control_list: List[ControlSeq]):
+         self.robot_manager.control_robot(meta_control_list=meta_control_list)
+diff --git a/env/scene_manager/objects/articulation.py b/env/scene_manager/objects/articulation.py
+index 103b8b7..ee80f41 100644
+--- a/env/scene_manager/objects/articulation.py
++++ b/env/scene_manager/objects/articulation.py
+@@ -1,3 +1,4 @@
++import os
+ import random
+ 
+ from isaaclab.sim.utils import find_global_fixed_joint_prim
+@@ -16,6 +17,8 @@ import omni.usd
+ from pxr import PhysxSchema, Usd, UsdGeom, UsdPhysics, UsdShade
+ import torch
+ 
++from env.diagnostics import diag_stage
++
+ 
+ class ArticulationObject(SingleArticulation):
+     """
+@@ -278,6 +281,12 @@ class ArticulationObject(SingleArticulation):
+                 imageable.MakeInvisible()
+ 
+     def relocate_offscreen(self):
++        mode = os.environ.get("ROBODOJO_DIAG_ART_RELOC_MODE", "")
++        stage_name = f"articulation.relocate[{self.instance_name}]"
++        diag_stage(f"{stage_name}:begin mode={mode or 'normal'}")
++        if mode == "skip":
++            diag_stage(f"{stage_name}:skipped")
++            return
+         _FAR_CENTER = (100000.0, 100000.0, 100000)
+         _FAR_JITTER = 1000.0
+         pos = (
+@@ -285,15 +294,25 @@ class ArticulationObject(SingleArticulation):
+             _FAR_CENTER[1] + random.uniform(-_FAR_JITTER, _FAR_JITTER),
+             _FAR_CENTER[2] + random.uniform(-_FAR_JITTER, _FAR_JITTER),
+         )
++        diag_stage(f"{stage_name}:before_joint_positions")
+         self.set_current_joint_positions(self.initial_joint_positions)
++        diag_stage(f"{stage_name}:after_joint_positions")
+         if self.physics_cfg.get("reset_drive", False):
+             self.reset_drive_targets()
++            diag_stage(f"{stage_name}:after_reset_drive")
+         ori = self.default_ori
+         scale = self.init_scale
++        diag_stage(f"{stage_name}:before_set_local_pose")
+         self.set_local_pose(pos, ori)
++        diag_stage(f"{stage_name}:after_set_local_pose")
+         self.set_local_scale(np.array(scale))
+         self._apply_default_velocities()
+-        self.app.update()
++        diag_stage(f"{stage_name}:after_velocity")
++        if mode != "no_app_update":
++            self.app.update()
++            diag_stage(f"{stage_name}:after_app_update")
++        else:
++            diag_stage(f"{stage_name}:app_update_skipped")
+         visible = self.visual_cfg.get("visible", True)
+         imageable = UsdGeom.Imageable(self.prim)
+         if imageable:
+@@ -301,6 +320,7 @@ class ArticulationObject(SingleArticulation):
+                 imageable.MakeVisible()
+             else:
+                 imageable.MakeInvisible()
++        diag_stage(f"{stage_name}:done")
+ 
+     def _get_object_transform(self, device=None):
+         """
+diff --git a/env/scene_manager/scene_manager.py b/env/scene_manager/scene_manager.py
+index 91ac927..7f084fe 100644
+--- a/env/scene_manager/scene_manager.py
++++ b/env/scene_manager/scene_manager.py
+@@ -10,6 +10,7 @@ import torch
+ 
+ from env.environment.isaac.isaac_rl_env import IsaacRLEnv
+ from env.global_configs import *
++from env.diagnostics import diag_stage
+ from env.scene_manager.layout_manager import LayoutManager
+ from env.scene_manager.objects.articulation import ArticulationObject
+ from env.scene_manager.objects.background import Background
+@@ -159,9 +160,12 @@ class SceneManager:
+     def reload_scene(self):
+         """Reload all environments from saved eval layouts."""
+         print("[INFO] Resetting all environments")
++        diag_stage("reload_scene:begin")
+         self.post_init()
++        diag_stage("reload_scene:after_post_init")
+         env_ids = torch.arange(self.num_envs, device=self.device)
+         self.reload_envs(env_ids)
++        diag_stage("reload_scene:after_reload_envs")
+         self.setup_scene = False
+ 
+     def reload_envs(self, env_ids: Sequence[int]):
+@@ -180,16 +184,20 @@ class SceneManager:
+             env_id = int(env_id)
+             self._set_env_seed(env_id)
+             self.reload_env_scene(env_id)
++            diag_stage(f"reload_envs:after_reload_env_scene env={env_id}")
+ 
+         for obj in self.pending_initialization:
+             obj.initialize()
+         self.pending_initialization.clear()
++        diag_stage("reload_envs:after_pending_init")
+ 
+         self.sim.sim_step()
++        diag_stage("reload_envs:after_sim_step")
+         for env_idx in range(self.num_envs):
+             self.relocate_stale_objects(env_idx)
+             if self._tables[env_idx] is not None:
+                 self._tables[env_idx].relocate_offscreen()
++        diag_stage("reload_envs:done")
+ 
+     def apply_saved_poses(self, env_idx_list: List[int]):
+         """Restore all scene objects to their saved eval-layout poses.
+@@ -229,22 +237,33 @@ class SceneManager:
+         """
+         if not self.setup_scene:
+             self.config[f"env{env_id}"] = self.layout_manager.load_saved_layout(env_id)
++        diag_stage(f"reload_env_scene[{env_id}]:begin")
+         self.reload_lights(env_id)
++        diag_stage(f"reload_env_scene[{env_id}]:after_lights")
+         self.reload_ground(env_id)
++        diag_stage(f"reload_env_scene[{env_id}]:after_ground")
+ 
+         self.reload_room(env_id)
++        diag_stage(f"reload_env_scene[{env_id}]:after_room")
+         self.reload_table(env_id)
++        diag_stage(f"reload_env_scene[{env_id}]:after_table")
+ 
+         if self.device.type == "cuda":
+             self.relocate_stale_objects(env_id, ["rigid", "articulation"])
++            diag_stage(f"reload_env_scene[{env_id}]:after_relocate")
+             # Clear existing objects (based on exclude_types)
+             self.clear_scene_objects(env_id, exclude_types=["rigid", "articulation"])
++            diag_stage(f"reload_env_scene[{env_id}]:after_clear")
+             self.spawn_scene_objects(env_id, exclude_types=["rigid", "articulation"])
++            diag_stage(f"reload_env_scene[{env_id}]:after_spawn")
+         else:
+             self.relocate_stale_objects(env_id, ["articulation"])
++            diag_stage(f"reload_env_scene[{env_id}]:after_relocate")
+             # Clear existing objects (based on exclude_types)
+             self.clear_scene_objects(env_id, exclude_types=["articulation"])
++            diag_stage(f"reload_env_scene[{env_id}]:after_clear")
+             self.spawn_scene_objects(env_id, exclude_types=["articulation"])
++            diag_stage(f"reload_env_scene[{env_id}]:after_spawn")
+ 
+     def spawn_category_objects(
+         self,
+@@ -274,6 +293,10 @@ class SceneManager:
+             if obj_type in exclude_types:
+                 continue
+ 
++            diag_stage(
++                f"spawn_category[{env_id}]:{cat_name}:{inst_name or i}:begin "
++                f"type={obj_type} asset={asset_to_spawn}"
++            )
+             default_pos = inst_cfg.get("default_pos", (0.0, 0.0, 0.0))
+             default_ori = inst_cfg.get("default_ori", (1.0, 0.0, 0.0, 0.0))
+             scale = inst_cfg.get("scale", (1, 1, 1))
+@@ -290,6 +313,7 @@ class SceneManager:
+             if obj is not None:
+                 self.register_scene_object(inst_name, env_id, obj)
+                 self.pending_initialization.append(obj)
++            diag_stage(f"spawn_category[{env_id}]:{cat_name}:{inst_name or i}:done")
+ 
+     def create_scene_object(
+         self,
+@@ -658,8 +682,10 @@ class SceneManager:
+             obj_types = type_mapping.keys()
+         for obj_type, obj_collection in type_mapping.items():
+             if obj_type in obj_types and env_id < len(obj_collection):
+-                for obj in obj_collection[env_id].values():
++                for obj_key, obj in obj_collection[env_id].items():
++                    diag_stage(f"relocate_stale[{env_id}]:{obj_type}:{obj_key}:begin")
+                     obj.relocate_offscreen()
++                    diag_stage(f"relocate_stale[{env_id}]:{obj_type}:{obj_key}:done")
+ 
+     def delete_scene_object(self, obj: Any):
+         """Delete object based on its type using appropriate method.
+diff --git a/src/eval_client/eval_env.py b/src/eval_client/eval_env.py
+index d2af1c0..8419d45 100644
+--- a/src/eval_client/eval_env.py
++++ b/src/eval_client/eval_env.py
+@@ -12,6 +12,7 @@ import websockets
+ 
+ from env.global_configs import *
+ from env.global_configs import BENCHMARK
++from env.diagnostics import diag_stage
+ from env.observation_manager.obs_manager import ObsManager
+ from env.seed_manager.seed_manager import SeedManager
+ from utils.cluttered_generator import UnStableError
+@@ -206,6 +207,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
+             self.obs_manager.initialize(self)
+ 
+         def reset(self, seed=None, options=None):
++            diag_stage("eval_env.reset:begin")
+             seed = list(seed)
+             if len(seed) < self.num_envs:
+                 seed = seed + [None] * (self.num_envs - len(seed))
+@@ -236,18 +238,25 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
+                     self.current_env_seed_map[idx] = seed[idx]
+ 
+             super().reset(seed=self.env_seeds, options=options)
++            diag_stage("eval_env.reset:after_task_env_reset")
+             self.obs_manager.reset()  # Reset observation manager for the next episode
+             self.setup_scene()
++            diag_stage("eval_env.reset:after_setup_scene")
+             self.robot_manager.set_origin_endpose()
+             self.robot_manager.set_robot_init_state()
+             self.reward_manager.init_state()
++            diag_stage("eval_env.reset:before_policy_reset")
+ 
+             self.model_client.call(func_name="reset")
++            diag_stage("eval_env.reset:done")
+ 
+         def setup_scene(self):
++            diag_stage("setup_scene:begin")
+             self.scene_manager.apply_saved_poses(env_idx_list=list(range(self.num_envs)))
++            diag_stage("setup_scene:after_apply_saved_poses")
+             self._align_layout_success()
+             success, unstable_envs = self.scene_manager.layout_manager.check_layout_stability(self)
++            diag_stage("setup_scene:after_stability_check")
+             unstable_envs = [idx for idx in set(unstable_envs) if idx < self.num_envs]
+             self.unstable_nums += len(unstable_envs)
+             self.episode_nums -= len(unstable_envs)
+@@ -255,11 +264,13 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
+                 raise UnStableError("All scene Unstable Error!")
+             for _ in range(10):
+                 self.render()
++            diag_stage("setup_scene:after_10_render")
+             for idx in range(200):
+                 self.sim_step()
+                 if idx % 5 == 0:
+                     self.obs_manager.render_for_capture()
+                     self.obs_manager.get_obs()
++            diag_stage("setup_scene:after_200_sim_steps")
+             if self.physx_monitor_enabled:
+                 self._check_physx_broken_envs()
+ 

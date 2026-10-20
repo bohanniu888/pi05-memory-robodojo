@@ -1,0 +1,70 @@
+#!/bin/bash
+# Minimal `conda` stand-in for the Isaac Sim 6.0 based image.
+#
+# The base image has no conda (NVIDIA ships it as a plain Python 3.12), but
+# XPolicyLab/utils/run_sim_env_client.sh does, under `set -e`:
+#
+#     source "$(conda info --base)/etc/profile.d/conda.sh"
+#     conda deactivate || true
+#     conda activate "${eval_env_conda_env}"
+#
+# Without this shim that is a hard failure before Isaac Sim is ever reached.
+# The simulator environment already *is* the active interpreter in this image,
+# so "activating" it is a no-op and the shim says so out loud instead of
+# pretending that a real conda environment exists.
+#
+# Only the subcommands the RoboDojo / XPolicyLab scripts actually use are
+# handled; anything else fails loudly rather than silently doing nothing.
+
+set -uo pipefail
+
+SHIM_BASE=/opt/conda-shim
+VENV=/opt/robodojo
+
+case "${1:-}" in
+    info)
+        if [[ "${2:-}" == "--base" ]]; then
+            echo "${SHIM_BASE}"
+            exit 0
+        fi
+        echo "[conda-shim] 'conda info ${2:-}' is not supported; only 'info --base' is." >&2
+        exit 1
+        ;;
+    env)
+        if [[ "${2:-}" == "list" ]]; then
+            echo "# conda environments:"
+            echo "#"
+            echo "base                  ${SHIM_BASE}"
+            echo "RoboDojo          *   ${VENV}"
+            exit 0
+        fi
+        echo "[conda-shim] 'conda env ${2:-}' is not supported; only 'env list' is." >&2
+        exit 1
+        ;;
+    activate)
+        echo "[conda-shim] activate '${2:-}' -> no-op: this image runs the RoboDojo venv (${VENV}) as its only interpreter" >&2
+        exit 0
+        ;;
+    deactivate)
+        exit 0
+        ;;
+    run)
+        shift
+        # `conda run -n ENV CMD...` is the only other shape used in the tree;
+        # drop the environment selector and exec the command directly.
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -n|--name|--prefix|-p) shift 2 ;;
+                --no-capture-output|--live-stream) shift ;;
+                *) break ;;
+            esac
+        done
+        [[ $# -gt 0 ]] || { echo "[conda-shim] conda run: no command given" >&2; exit 2; }
+        exec "$@"
+        ;;
+    *)
+        echo "[conda-shim] subcommand '${1:-}' is not implemented by this shim." >&2
+        echo "[conda-shim] This image has no real conda; the RoboDojo venv is always active." >&2
+        exit 1
+        ;;
+esac

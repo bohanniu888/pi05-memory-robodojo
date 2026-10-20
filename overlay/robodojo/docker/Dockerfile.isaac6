@@ -1,0 +1,268 @@
+# syntax=docker/dockerfile:1
+# RoboDojo simulator / evaluation image -- "Path G": Isaac Sim 6.0.1 on driver 595.80.
+#
+# Why this file exists (plan sections 2B-3 .. 2B-8):
+#   All five GPU nodes run driver 595.80. Isaac Sim 5.1.0 -- the version RoboDojo
+#   pins -- segfaults during RTX start-up on that driver branch, inside
+#   librtx.scenedb.plugin.so!carbOnPluginStartup. That was reproduced with
+#   NVIDIA's own pristine nvcr.io container at byte-identical stack offsets, so
+#   it is a version/driver incompatibility, not a defect in our previous image.
+#   Isaac Sim 6.0.x is validated against 595.58.03 -- the same driver branch --
+#   and was measured on this cluster to boot AND render on 595.80.
+#
+# So this image swaps the Isaac Sim runtime (5.1.0 -> 6.0.1) and keeps Isaac Lab
+# (2.3.2), CuRobo and the entire RoboDojo source tree unchanged. Two consequences,
+# stated up front:
+#   * Physics and rendering differ from 5.1 (Kit 110 vs 107, PhysX 110.1 vs
+#     107.3, RTX Hydra 1.0.4 vs 1.0.0). Scores are therefore an approximation,
+#     not a strict reproduction. There is no switch that selects 5.1's PhysX.
+#   * Isaac Lab 2.3.2 is not written for 6.0. Exactly one import path moved
+#     (omni.physics.tensors.impl.api -> omni.physics.tensors.api, six files) and
+#     is bridged by docker/patch/sitecustomize.py. 195 of the class/method
+#     signatures RoboDojo touches compare identical; none of the four methods
+#     dropped from ArticulationView are referenced anywhere in the tree.
+#
+# Differences from the 5.1 Dockerfile and their reasons:
+#   * Base is NVIDIA's own isaac-sim container. It has no conda and no system
+#     python3: the interpreter is /isaac-sim/kit/python/bin/python3 (3.12), so
+#     the simulator environment is a venv and `isaaclab.sh --install` finds it
+#     through VIRTUAL_ENV instead of CONDA_PREFIX.
+#   * `pip install "isaacsim[all,extscache]==6.0.1"` is gone -- the base image
+#     already IS Isaac Sim; its extensions live in /isaac-sim/exts*.
+#   * docker/conda-shim/ is installed because run_sim_env_client.sh does
+#     `source $(conda info --base)/etc/profile.d/conda.sh; conda activate ENV`
+#     under `set -e`, and would abort before Isaac Sim is ever reached.
+#   * python.sh is replaced by docker/robodojo-env.sh, since python.sh pins the
+#     interpreter to the kit python and cannot see the venv.
+#
+# Build (the podman default OCI format silently drops the SHELL instruction --
+# always pass --format docker):
+#   podman build --format docker --network host \
+#     --build-arg ISAACSIM_IMAGE=nvcr.m.daocloud.io/nvidia/isaac-sim:6.0.1 \
+#     -t robodojo:isaac6 .
+
+ARG ISAACSIM_IMAGE=nvcr.m.daocloud.io/nvidia/isaac-sim:6.0.1
+FROM ${ISAACSIM_IMAGE}
+
+SHELL ["/bin/bash", "-c"]
+
+# The base image runs as uid 1234 (isaac-sim), which maps to a subuid on the host
+# and therefore cannot write host-owned bind mounts. Running as root inside the
+# container maps back to the invoking host user, so mounted paths stay writable
+# and keep the caller's ownership.
+USER root
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    OMNI_KIT_ACCEPT_EULA=YES \
+    ACCEPT_EULA=Y \
+    PRIVACY_CONSENT=Y \
+    TERM=xterm-256color \
+    PIP_USER=0 \
+    PYTHONNOUSERSITE=1 \
+    FORCE_CUDA=1 \
+    TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0+PTX"
+
+ARG PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
+ENV PIP_INDEX_URL=${PIP_INDEX_URL}
+
+# ── System dependencies ──────────────────────────────────────────────────────
+# Only what the base image lacks. It already ships the headless GL/EGL/Vulkan
+# stack (libGLU.so.1, libXt.so.6, libvulkan.so.1 and NVIDIA's ICD files), so
+# those are deliberately NOT reinstalled -- adding mesa's GLVND/EGL vendors on
+# top is exactly what makes RTX device init wedge on the first rendered frame.
+# build-essential/cmake/ninja are needed to build the CuRobo extension.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake ninja-build pkg-config \
+        git git-lfs wget curl ca-certificates \
+        ffmpeg netcat-openbsd \
+    && git lfs install \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace/RoboDojo
+
+# ── Simulator environment (venv) ─────────────────────────────────────────────
+# `python -m venv` on the kit python is what the CuRobo probe already validated
+# on this image. setuptools is absent from the base image, so it is installed
+# first; afterwards `isaaclab.sh --install` (setuptools-based, editable) works.
+RUN /isaac-sim/kit/python/bin/python3 -m venv /opt/robodojo \
+    && /opt/robodojo/bin/python -m pip install --upgrade pip setuptools wheel \
+    && /opt/robodojo/bin/python -V
+
+# From here on the simulator venv is the image's only interpreter. Pretty much
+# every layer below therefore uses `python -m pip` without sourcing
+# robodojo-env.sh first -- and that is deliberate, not laziness.
+#
+# If PYTHONPATH is set when pip runs (which is exactly what robodojo-env.sh does,
+# because isaacsim needs it), pip treats the base image's pip_prebundle copies as
+# "Requirement already satisfied", resolves them from
+# /isaac-sim/extscache/omni.kit.pip_archive-*/pip_prebundle -- and then, for a
+# pin that differs (numpy==1.26.0, pillow==11.3.0, packaging==23.0), *uninstalls*
+# them. Those files belong to the Isaac Sim installation, so a pip run in that
+# environment can quietly gut the base image. The sanity layer at the end
+# asserts the extension cache is still intact.
+#
+# Keeping pip blind to the prebundle also makes build-time and run-time agree:
+# the venv holds numpy 1.26.0, and robodojo-env.sh prepends the venv so the same
+# numpy 1.26.0 is what the app actually imports.
+ENV VIRTUAL_ENV=/opt/robodojo \
+    PATH=/opt/robodojo/bin:/opt/conda-shim/bin:/isaac-sim/kit/python/bin:${PATH}
+
+# ── Base pip dependencies ────────────────────────────────────────────────────
+# setup_base_deps() from scripts/install.sh. requirements.txt is copied alone so
+# this layer caches independently of the source tree.
+COPY scripts/requirements.txt /workspace/RoboDojo/scripts/requirements.txt
+RUN python -m pip install -r scripts/requirements.txt \
+    && python -m pip install opencv-python-headless==4.11.0.86 pillow==11.3.0 matplotlib "scipy==1.15.3" scikit-learn \
+    && python -m pip install numpy==1.26.0
+
+# ── PyTorch (cu128) ──────────────────────────────────────────────────────────
+# Same version the validated 5.1 image used and the one Isaac Lab 2.3.2 targets
+# (setup.py: torch>=2.7). Driver 595.80 is backward compatible with the cu128
+# wheels. Isaac Sim itself is NOT pip-installed here -- see the header.
+RUN python -m pip install "numpy==1.26.0" "typing_extensions==4.12.2" "filelock==3.13.1" \
+    && python -m pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
+        --index-url https://download.pytorch.org/whl/cu128
+
+# ── IsaacLab + CuRobo (built from the vendored submodules) ───────────────────
+# setup_isaaclab() + setup_curobo() from scripts/install.sh. Only third_party/ is
+# copied here so a source edit does not invalidate these expensive build layers.
+COPY third_party/ /workspace/RoboDojo/third_party/
+RUN cd third_party/IsaacLab && ./isaaclab.sh --install none
+
+# CuRobo resolves its version through setuptools_scm whenever a `.git` exists.
+# Submodule `.git` is a gitfile pointing into the parent repository, which is not
+# present in the build context, so the lookup raises LookupError. Pinning the
+# pretend version keeps the build deterministic until the pointers are stripped
+# further down. curobo's default solver backend (cuda_core) compiles CUDA at
+# runtime through cuda.core and does not need nvcc.
+RUN cd third_party/curobo \
+    && (python -m pip uninstall -y nvidia-curobo curobo || true) \
+    && SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 python -m pip install -e ".[cu12]" --no-build-isolation
+
+# repin_after_curobo() from scripts/install.sh: CuRobo pulls newer releases of
+# these and silently breaks the Isaac Lab / RoboDojo contract.
+RUN python -m pip install \
+        "numpy==1.26.0" \
+        "packaging==23.0" \
+        "typing_extensions==4.12.2" \
+        "filelock==3.13.1" \
+        "websockets==12.0" \
+        "scipy==1.15.3" \
+        "warp-lang==1.11.0"
+
+# ── RoboDojo source + XPolicyLab client/adapter code ─────────────────────────
+# Explicit copies (not `COPY .`) so the compiled artifacts under third_party/
+# survive. Heavy policy source, weights, checkpoints, assets and runtime outputs
+# are excluded via .dockerignore.
+COPY env/ /workspace/RoboDojo/env/
+COPY env_cfg/ /workspace/RoboDojo/env_cfg/
+COPY task/ /workspace/RoboDojo/task/
+COPY src/ /workspace/RoboDojo/src/
+COPY utils/ /workspace/RoboDojo/utils/
+COPY scripts/ /workspace/RoboDojo/scripts/
+COPY XPolicyLab/ /workspace/RoboDojo/XPolicyLab/
+COPY pyproject.toml README.md LICENSE /workspace/RoboDojo/
+
+# ── Strip broken submodule .git pointers ─────────────────────────────────────
+# A submodule `.git` is a FILE, so .dockerignore's `.git/` directory rule misses
+# it. Leaving them in place makes CuRobo's setuptools_scm raise LookupError at
+# import time inside the image, which crashes the eval client.
+RUN find /workspace/RoboDojo/third_party -name .git -prune -exec rm -rf {} + 2>/dev/null; true
+
+# ── Compatibility layer, entrypoint, sanity ──────────────────────────────────
+# Everything below this line is cheap and expected to change as the Isaac Sim
+# 6.0 port progresses, so all the volatile files are COPYed here -- after the
+# pip / PyTorch / Isaac Lab / CuRobo layers. Editing docker/patch/*.py then
+# rebuilds in seconds instead of re-downloading 2.5 GB of wheels.
+COPY docker/entrypoint.isaac6.sh /usr/local/bin/entrypoint.sh
+COPY docker/robodojo-env.sh /usr/local/bin/robodojo-env.sh
+COPY docker/conda-shim/ /opt/conda-shim/
+COPY docker/patch/ /opt/robodojo-patch/
+COPY docker/checks/ /opt/robodojo-checks/
+RUN chmod +x /usr/local/bin/robodojo-env.sh /usr/local/bin/entrypoint.sh /opt/conda-shim/bin/conda
+
+# Note what is NOT checked here: `import omni.physics.tensors.api`. That module
+# lives in /isaac-sim/extscache/omni.physics.tensors-<ver>/ and only reaches
+# sys.path once SimulationApp has booted kit and enabled the extension -- outside
+# a live app it raises "No module named 'omni.physics'" even though the file is
+# there. That is also why the alias shim resolves lazily. The runtime half of
+# this check lives in scripts/verify_isaac6_stack.py, which runs inside a booted
+# SimulationApp on a GPU node.
+RUN source /usr/local/bin/robodojo-env.sh \
+    && python -c "import isaacsim; print('isaacsim', isaacsim.__file__)" \
+    && python /opt/robodojo-checks/alias_selftest.py \
+    && python -c "\
+import glob, os; \
+ext = glob.glob('/isaac-sim/extscache/omni.physics.tensors-*'); \
+assert ext, 'omni.physics.tensors extension missing from the base image'; \
+api = os.path.join(ext[0], 'omni/physics/tensors/api.py'); \
+assert os.path.isfile(api), f'new-layout api.py missing: {api}'; \
+assert not os.path.isdir(os.path.join(ext[0], 'omni/physics/tensors/impl')), \
+    'the old impl/ layout is back; sitecustomize alias may be unnecessary'; \
+print('tensors layout OK ->', api)" \
+    && python -c "\
+import sitecustomize, sys; \
+names = [getattr(f, '__name__', type(f).__name__) for f in sys.meta_path]; \
+assert '_ProjectTreeFinder' in names, 'project-tree finder not installed'; \
+assert '_AliasFinder' in names, 'tensors alias finder not installed'; \
+print('meta_path shims OK')"
+
+# ── Sanity ───────────────────────────────────────────────────────────────────
+# Three separate things are asserted here and they fail for different reasons:
+#   1. the base image's Isaac Sim installation is untouched by all the pip work
+#   2. the runtime environment resolves to the pinned versions, from the venv
+#   3. the XPolicyLab entrypoints find a conda to talk to
+RUN set -e; \
+    echo "--- 1. Isaac Sim extension cache intact? ---"; \
+    ls -d /isaac-sim/extscache/omni.kit.pip_archive-*/pip_prebundle/numpy >/dev/null; \
+    test -f /isaac-sim/extscache/omni.kit.pip_archive-*/pip_prebundle/numpy/__init__.py; \
+    ls -d /isaac-sim/extscache/omni.physics.tensors-* >/dev/null; \
+    echo "    OK"
+
+RUN source /usr/local/bin/robodojo-env.sh \
+    && set -e \
+    && echo "--- 2. runtime environment ---" \
+    && python -c "\
+import numpy, packaging, PIL, websockets, torch, curobo, isaacsim, sys; \
+print('    interpreter', sys.executable); \
+print('    numpy      ', numpy.__version__, numpy.__file__); \
+print('    packaging  ', packaging.__version__); \
+print('    pillow     ', PIL.__version__); \
+print('    websockets ', websockets.__version__); \
+print('    torch      ', torch.__version__); \
+print('    curobo     ', curobo.__file__); \
+assert numpy.__version__ == '1.26.0', numpy.__version__; \
+assert numpy.__file__.startswith('/opt/robodojo/'), numpy.__file__" \
+    && python -c "import yaml, msgpack_numpy, websockets, transforms3d; print('    client deps OK')" \
+    && python -c "from isaaclab.app import AppLauncher; print('    isaaclab.app OK')" \
+    && echo "--- 3. conda shim ---" \
+    && test -f /workspace/RoboDojo/XPolicyLab/utils/run_sim_env_client.sh \
+    && conda info --base \
+    && (source "$(conda info --base)/etc/profile.d/conda.sh"; conda activate RoboDojo; echo "    activate OK")
+
+# ── Known, accepted defect: open3d cannot be imported ────────────────────────
+# scripts/requirements.txt lists open3d, so it is installed. It cannot be
+# imported here, and that is not a regression introduced by this image:
+#
+#   open3d/__init__.py -> open3d.visualization -> dash -> pydantic
+#     -> pydantic_core -> `from typing_extensions import Sentinel`
+#
+# and typing_extensions==4.12.2 -- which RoboDojo pins itself, three times
+# (scripts/install.sh lines 21, 54, 140) -- predates Sentinel. The Isaac Sim 5.1
+# image had the identical pin and therefore the identical latent breakage; it
+# was simply never exercised, because the simulator never started on driver
+# 595.80 and the eval client was never reached.
+#
+# It is harmless for evaluation: `import open3d` appears zero times in RoboDojo,
+# in XPolicyLab's OpenDM adapter / utils / client_server, and in Isaac Lab. This
+# layer records the situation so a later `import open3d` failure is recognised as
+# pre-existing rather than debugged from scratch.
+RUN source /usr/local/bin/robodojo-env.sh \
+    && (python -c "import open3d" 2>/dev/null \
+        && echo "    open3d imports cleanly (the typing_extensions conflict is gone)" \
+        || echo "    open3d import fails as documented -- expected, unused by the eval path")
+
+ENV PYTHONPATH=/workspace/RoboDojo
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["bash"]
